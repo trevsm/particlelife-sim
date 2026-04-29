@@ -23,11 +23,24 @@ export type Spec = {
   cellSize: number
   pixelScale: number
   genMatrix: boolean
-  overlays: { showVel: boolean; showGrid: boolean }
+  overlays: {
+    showVel: boolean
+    showGrid: boolean
+    showTrails: boolean
+    /** Debug: outline open-world trail FBO tiles (ignored when wrap is on). */
+    showTrailTiles: boolean
+  }
+  /** Per frame, fraction of previous trail color kept (0.7–0.98). Higher = longer trails. */
+  trailPersistence: number
   mutualOnly: boolean
   settleEnabled: boolean
   settleK: number
   settleR: number
+  /**
+   * How many fixed-dt physics steps to run per animation frame (1 = baseline).
+   * Rounded and clamped to 1–50 in the UI. Higher = faster simulation time, more CPU/GPU load.
+   */
+  timeScale: number
 }
 
 export type Sim = {
@@ -41,7 +54,11 @@ export type Sim = {
   interleaved: Float32Array
   fx: Float32Array
   fy: Float32Array
-  gridDim: number
+  /** Horizontal / vertical torus half-extents in world units (y fixed; x follows view aspect). */
+  worldHalfW: number
+  worldHalfH: number
+  gridDimX: number
+  gridDimY: number
   cellHead: Int32Array
   next: Int32Array
   rng: () => number
@@ -50,4 +67,8 @@ export type Sim = {
   A: number[][]
   rMinMx: number[][]
   RMx: number[][]
+  /** Open-world (!wrap): uniform-grid origin and bucket size (may be ≥ spec.cellSize if cloud is huge). */
+  gridOriginX: number
+  gridOriginY: number
+  gridCellEff: number
 }

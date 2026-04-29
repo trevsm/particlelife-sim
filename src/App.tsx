@@ -1,18 +1,24 @@
-import React, { useEffect, useRef, useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import type { Sim, Spec } from "./simTypes"
 import {
   createParticleGL,
   drawParticles,
   ensureParticleBufferCapacity,
   resizeDrawingSurface,
+  defaultViewCamera,
   type ParticleGL,
+  type ViewCamera,
   type ViewLayout,
 } from "./webglParticles"
 import { createGpuSimRunner, type GpuSimRunner } from "./webgpuSim"
+import {
+  OPEN_TRAIL_CHUNK_WORLD,
+  openTrailVisibleChunkRange,
+} from "./openTrailChunks"
 
 /**
  * Particle Life backend + editable ruleset (A matrix) with toolbar.
- * - World in [-1,1]^2; optional wrap.
+ * - World: vertical span [-1,1]; horizontal span scales with viewport aspect; optional wrap.
  * - Pairwise accelerator with rMin (Particle-Life style).
  * - Second-order dynamics with friction (velocity damping) and vMax clamp.
  * - Uniform-grid neighbor search.
@@ -57,11 +63,46 @@ const TYPE_COLORS = [
   "#7FFF00", // chartreuse
   "#CC79A7", // pink (okabe-ito)
   "#ffffff", // white
+  "#CD853F", // peru
+  "#DA70D6", // orchid
+  "#20B2AA", // light sea green
+  "#9370DB", // medium purple
+  "#3CB371", // medium sea green
+  "#F4A460", // sandy brown
+  "#4169E1", // royal blue
+  "#DC143C", // crimson
+  "#2E8B57", // sea green
+  "#FF1493", // deep pink
+  "#00FA9A", // medium spring green
+  "#8B4513", // saddle brown
+  "#483D8B", // dark slate blue
+  "#FFD700", // gold
+  "#FF6347", // tomato
+  "#40E0D0", // turquoise
+  "#EE82EE", // violet (named)
+  "#9ACD32", // yellow green
+  "#D2691E", // chocolate
+  "#5F9EA0", // cadet blue
+  "#DDA0DD", // plum
+  "#00FF7F", // spring green
+  "#B22222", // fire brick
+  "#48D1CC", // medium turquoise
+  "#C71585", // medium violet red
+  "#32CD32", // lime green
+  "#FF4500", // orange red
+  "#1E90FF", // dodger blue
+  "#ADFF2F", // green yellow
+  "#FF69B4", // hot pink
+  "#BA55D3", // medium orchid
+  "#F08080", // light coral
+  "#7CFC00", // lawn green
 ]
 
 /** Max particles (WebGL draws in one call; physics is still CPU spatial-hash). */
 const MAX_PARTICLES = 1_000_000
 const ENABLE_WEBGPU_PHYSICS = true
+/** Cap open-world spatial hash dimensions so memory stays bounded if the cloud spreads. */
+const OPEN_GRID_MAX_SIDE = 512
 
 // ========================= RNG =========================
 function mulberry32(seed: number) {
@@ -108,7 +149,63 @@ function genRingRadiusPreset(K: number, r0: number, R0: number) {
 }
 
 // ========================= World helpers =========================
-const WORLD_SIZE = 2.0 // [-1,1]
+/** Vertical torus half-extent; horizontal follows view aspect ratio. */
+const WORLD_HALF_H = 1
+/** Initial spawn: uniform disk at world origin (tight blob vs full square). */
+const INIT_CLUSTER_RADIUS = 0.09
+/** Reference vertical span for force scaling vs pixel space. */
+const REF_VERTICAL_SPAN = 2 * WORLD_HALF_H
+
+/** Max width/height aspect for GPU grid buffer sizing (ultrawide displays). */
+const MAX_VIEW_ASPECT = 48
+
+function maxGridCellsForCellSize(cellSize: number): number {
+  const maxWorldHalfW = MAX_VIEW_ASPECT * WORLD_HALF_H
+  const worldWidth = 2 * maxWorldHalfW
+  const worldHeight = REF_VERTICAL_SPAN
+  const gx = Math.max(1, Math.ceil(worldWidth / cellSize))
+  const gy = Math.max(1, Math.ceil(worldHeight / cellSize))
+  return gx * gy
+}
+
+function foldPeriodic(pos: number, halfSpan: number, fullSpan: number): number {
+  let p = pos
+  while (p < -halfSpan) p += fullSpan
+  while (p > halfSpan) p -= fullSpan
+  return p
+}
+
+function syncSimWorldToLayout(sim: Sim, layout: ViewLayout) {
+  if (layout.width < 2 || layout.height < 2) return
+  const worldHalfW = (layout.width / layout.height) * WORLD_HALF_H
+  const worldHalfH = WORLD_HALF_H
+  if (sim.spec.wrap) {
+    const worldWidth = 2 * worldHalfW
+    const worldHeight = 2 * worldHalfH
+    const gx = Math.max(1, Math.ceil(worldWidth / sim.spec.cellSize))
+    const gy = Math.max(1, Math.ceil(worldHeight / sim.spec.cellSize))
+    if (gx !== sim.gridDimX || gy !== sim.gridDimY) {
+      sim.gridDimX = gx
+      sim.gridDimY = gy
+      sim.cellHead = new Int32Array(gx * gy)
+    }
+    const extentChanged =
+      Math.abs(worldHalfW - sim.worldHalfW) > 1e-7 ||
+      Math.abs(worldHalfH - sim.worldHalfH) > 1e-7
+    sim.worldHalfW = worldHalfW
+    sim.worldHalfH = worldHalfH
+    if (extentChanged) {
+      const N = Math.min(sim.spec.N, sim.x.length)
+      for (let i = 0; i < N; i++) {
+        sim.x[i] = foldPeriodic(sim.x[i], worldHalfW, worldWidth)
+        sim.y[i] = foldPeriodic(sim.y[i], worldHalfH, worldHeight)
+      }
+    }
+  } else {
+    sim.worldHalfW = worldHalfW
+    sim.worldHalfH = worldHalfH
+  }
+}
 
 // ========================= Particle Life accelerator =========================
 /** Sandbox Science triangular force curve; hard repulsion inside rMin. */
@@ -160,105 +257,11 @@ function genRingPreset(
   return A
 }
 
-const DEFAULT_K = 7
+const DEFAULT_K = 30
 
-/** Reference UI matrices (7×7), matched to the default Vue particle-life controls. */
-const REF_DEFAULT_A: number[][] = [
-  [0.34, -0.92, -0.13, 0.22, -0.25, -0.17, -0.74],
-  [-0.1, -0.26, -0.19, 0.58, 0.64, -0.75, 0.59],
-  [-0.12, -0.55, 0.44, 0.72, 0.44, -0.95, -0.22],
-  [0.84, -0.24, 0.84, -0.82, 0.65, 0.46, -0.7],
-  [-0.25, 0.37, 0.7, 0.21, 0.45, -0.27, -0.71],
-  [0.77, -0.64, -0.27, -0.42, 0.84, -0.12, 0.61],
-  [0.94, -0.17, 0.13, 0.8, -0.5, -0.58, -0.36],
-]
+const REF_WORLD_UNITS_PER_PX = REF_VERTICAL_SPAN / 1280
 
-const REF_WORLD_UNITS_PER_PX = WORLD_SIZE / 1280
-
-/** Slider tick labels from that UI (12–24 px); mapped into our [-1,1] world. */
-const REF_RMIN_UI: number[][] = [
-  [21, 24, 13, 17, 15, 16, 17],
-  [20, 14, 12, 16, 19, 16, 22],
-  [15, 23, 15, 20, 16, 21, 16],
-  [23, 19, 22, 13, 24, 19, 14],
-  [12, 13, 13, 12, 12, 12, 23],
-  [23, 17, 12, 20, 12, 17, 21],
-  [21, 22, 17, 18, 22, 13, 14],
-]
-
-/** Slider tick labels (33–63 px); mapped into our [-1,1] world. */
-const REF_RMAX_UI: number[][] = [
-  [52, 58, 36, 58, 44, 44, 33],
-  [39, 55, 63, 58, 63, 43, 54],
-  [34, 63, 52, 42, 44, 60, 37],
-  [42, 60, 61, 49, 63, 36, 48],
-  [63, 38, 59, 39, 38, 40, 46],
-  [49, 54, 54, 42, 44, 63, 54],
-  [62, 42, 62, 36, 53, 41, 48],
-]
-
-function refUiMinRToWorld(v: number): number {
-  return clamp(v, 12, 24) * REF_WORLD_UNITS_PER_PX
-}
-
-function refUiMaxRToWorld(v: number): number {
-  return clamp(v, 33, 63) * REF_WORLD_UNITS_PER_PX
-}
-
-function buildRefDefaultRadii(): { rMinMx: number[][]; RMx: number[][] } {
-  const K = REF_RMIN_UI.length
-  const pairEps = 0.002
-  const rMinMx: number[][] = Array.from({ length: K }, () => [])
-  const RMx: number[][] = Array.from({ length: K }, () => [])
-  for (let i = 0; i < K; i++) {
-    for (let j = 0; j < K; j++) {
-      const rmin = refUiMinRToWorld(REF_RMIN_UI[i][j])
-      const rmax = Math.max(
-        refUiMaxRToWorld(REF_RMAX_UI[i][j]),
-        rmin + pairEps
-      )
-      rMinMx[i][j] = rmin
-      RMx[i][j] = rmax
-    }
-  }
-  return { rMinMx, RMx }
-}
-
-const SPEC_REF_R = buildRefDefaultRadii()
-
-/** Default spec: reference Vue matrices + high damping for stable clusters. */
-const SPEC: Spec = {
-  N: 6_000,
-  K: DEFAULT_K,
-  seed: 1337,
-
-  A: cloneMx(REF_DEFAULT_A),
-  rMinMx: cloneMx(SPEC_REF_R.rMinMx),
-  RMx: cloneMx(SPEC_REF_R.RMx),
-  rMin: DEFAULT_R_MIN,
-  R: DEFAULT_R_MAX,
-
-  dt: 1 / 60,
-  friction: 0.3,
-  repel: DEFAULT_REPEL,
-  forceFactor: DEFAULT_FORCE_FACTOR,
-  vMax: 4,
-
-  wrap: true,
-  cellSize: 0.05,
-
-  pixelScale: 800,
-  genMatrix: false,
-
-  overlays: { showVel: false, showGrid: false },
-
-  mutualOnly: false,
-  settleEnabled: false,
-  settleK: 0.08,
-  settleR: 0.08,
-}
-
-const LS_KEY_V2 = "pl_rules_v5"
+const LS_KEY_V2 = "pl_rules_v6"
 const LS_KEY_V1 = "pl_rules_v1"
 
 function saveRulesToLS(
@@ -316,7 +319,7 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
   const rng = mulberry32(seedOverride ?? spec.seed)
   const K = spec.K
 
-  // choose rules: localStorage → preset (ring) → spec
+  // choose rules: localStorage → random (genMatrix) → spec matrices
   const loaded = loadRulesFromLS(K, spec.rMin, spec.R)
   let A: number[][]
   let rMinMx: number[][]
@@ -327,10 +330,11 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
     rMinMx = sane.rMinMx
     RMx = sane.RMx
   } else if (spec.genMatrix) {
-    A = genRingPreset(K)
-    const ring = genRingRadiusPreset(K, spec.rMin, spec.R)
-    rMinMx = ring.rMinMx
-    RMx = ring.RMx
+    const rng = mulberry32(seedOverride ?? spec.seed)
+    A = genRandomMatrix(K, rng)
+    const rm = genRandomRMinTabMatrices(K, rng, spec.rMin, spec.R)
+    rMinMx = rm.rMinMx
+    RMx = rm.RMx
   } else {
     A = spec.A
     const ring = genRingRadiusPreset(K, spec.rMin, spec.R)
@@ -346,16 +350,85 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
   const interleaved = new Float32Array(spec.N * 3)
 
   for (let i = 0; i < spec.N; i++) {
-    x[i] = randRange(rng, -1, 1)
-    y[i] = randRange(rng, -1, 1)
+    const ang = rng() * 2 * Math.PI
+    const rad = INIT_CLUSTER_RADIUS * Math.sqrt(rng())
+    x[i] = rad * Math.cos(ang)
+    y[i] = rad * Math.sin(ang)
     vx[i] = randRange(rng, -0.005, 0.005)
     vy[i] = randRange(rng, -0.005, 0.005)
     type[i] = Math.floor(rng() * K)
   }
 
-  const gridDim = Math.max(1, Math.ceil(WORLD_SIZE / spec.cellSize))
-  const cellHead = new Int32Array(gridDim * gridDim)
+  const worldHalfW = 1
+  const worldHalfH = WORLD_HALF_H
   const next = new Int32Array(spec.N)
+
+  let gridDimX: number
+  let gridDimY: number
+  let cellHead: Int32Array
+  let gridOriginX: number
+  let gridOriginY: number
+  let gridCellEff: number
+
+  if (spec.wrap) {
+    const worldWidth = 2 * worldHalfW
+    const worldHeight = 2 * worldHalfH
+    gridDimX = Math.max(1, Math.ceil(worldWidth / spec.cellSize))
+    gridDimY = Math.max(1, Math.ceil(worldHeight / spec.cellSize))
+    cellHead = new Int32Array(gridDimX * gridDimY)
+    gridOriginX = 0
+    gridOriginY = 0
+    gridCellEff = spec.cellSize
+  } else {
+    const mr = maxRMx(RMx)
+    const cs0 = spec.cellSize
+    const reach0 = Math.max(1, Math.ceil(mr / cs0))
+    const pad0 = mr + reach0 * cs0 + cs0
+    let minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity
+    for (let i = 0; i < spec.N; i++) {
+      const xi = x[i],
+        yi = y[i]
+      if (xi < minX) minX = xi
+      if (xi > maxX) maxX = xi
+      if (yi < minY) minY = yi
+      if (yi > maxY) maxY = yi
+    }
+    let spanX = maxX - minX + 2 * pad0
+    let spanY = maxY - minY + 2 * pad0
+    if (spanX < cs0) spanX = cs0
+    if (spanY < cs0) spanY = cs0
+    let cs = cs0
+    let ncx = Math.max(1, Math.ceil(spanX / cs))
+    let ncy = Math.max(1, Math.ceil(spanY / cs))
+    if (ncx > OPEN_GRID_MAX_SIDE || ncy > OPEN_GRID_MAX_SIDE) {
+      const scale = Math.max(
+        ncx / OPEN_GRID_MAX_SIDE,
+        ncy / OPEN_GRID_MAX_SIDE
+      )
+      cs = cs0 * scale
+      ncx = Math.min(
+        OPEN_GRID_MAX_SIDE,
+        Math.max(1, Math.ceil(spanX / cs))
+      )
+      ncy = Math.min(
+        OPEN_GRID_MAX_SIDE,
+        Math.max(1, Math.ceil(spanY / cs))
+      )
+    }
+    const midX = (minX + maxX) * 0.5
+    const midY = (minY + maxY) * 0.5
+    const coverX = ncx * cs
+    const coverY = ncy * cs
+    gridOriginX = midX - coverX * 0.5
+    gridOriginY = midY - coverY * 0.5
+    gridCellEff = cs
+    gridDimX = ncx
+    gridDimY = ncy
+    cellHead = new Int32Array(ncx * ncy)
+  }
 
   return {
     spec,
@@ -368,7 +441,10 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
     interleaved,
     fx: new Float32Array(spec.N),
     fy: new Float32Array(spec.N),
-    gridDim,
+    worldHalfW,
+    worldHalfH,
+    gridDimX,
+    gridDimY,
     cellHead,
     next,
     rng,
@@ -377,24 +453,145 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
     A: cloneMx(A),
     rMinMx: cloneMx(rMinMx),
     RMx: cloneMx(RMx),
+    gridOriginX,
+    gridOriginY,
+    gridCellEff,
   }
 }
 
 // ========================= Neighbors =========================
-function cellIndexOf(x: number, y: number, gridDim: number): number {
-  const gx = clamp(Math.floor((x + 1) * 0.5 * gridDim), 0, gridDim - 1)
-  const gy = clamp(Math.floor((y + 1) * 0.5 * gridDim), 0, gridDim - 1)
-  return gx + gy * gridDim
+function cellIndexOfTorus(
+  x: number,
+  y: number,
+  worldHalfW: number,
+  worldHalfH: number,
+  worldWidth: number,
+  worldHeight: number,
+  gridDimX: number,
+  gridDimY: number
+): number {
+  const gxx = clamp(
+    Math.floor(((x + worldHalfW) / worldWidth) * gridDimX),
+    0,
+    gridDimX - 1
+  )
+  const gyy = clamp(
+    Math.floor(((y + worldHalfH) / worldHeight) * gridDimY),
+    0,
+    gridDimY - 1
+  )
+  return gxx + gridDimX * gyy
 }
+
+function cellIndexOfOpen(
+  x: number,
+  y: number,
+  ox: number,
+  oy: number,
+  cs: number,
+  gridDimX: number,
+  gridDimY: number
+): number {
+  const gxx = clamp(Math.floor((x - ox) / cs), 0, gridDimX - 1)
+  const gyy = clamp(Math.floor((y - oy) / cs), 0, gridDimY - 1)
+  return gxx + gridDimX * gyy
+}
+
+/** Resize/reanchor open-world grid to cover all particles (plus neighbor padding). */
+function prepareOpenGrid(sim: Sim, N: number, maxR: number) {
+  const cs0 = sim.spec.cellSize
+  let minX = Infinity,
+    maxX = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity
+  for (let i = 0; i < N; i++) {
+    const xi = sim.x[i],
+      yi = sim.y[i]
+    if (xi < minX) minX = xi
+    if (xi > maxX) maxX = xi
+    if (yi < minY) minY = yi
+    if (yi > maxY) maxY = yi
+  }
+  if (!Number.isFinite(minX)) return
+
+  const reachNorm = Math.max(1, Math.ceil(maxR / cs0))
+  const pad = maxR + reachNorm * cs0 + cs0
+  let spanX = maxX - minX + 2 * pad
+  let spanY = maxY - minY + 2 * pad
+  if (spanX < cs0) spanX = cs0
+  if (spanY < cs0) spanY = cs0
+
+  let cs = cs0
+  let ncx = Math.max(1, Math.ceil(spanX / cs))
+  let ncy = Math.max(1, Math.ceil(spanY / cs))
+  if (ncx > OPEN_GRID_MAX_SIDE || ncy > OPEN_GRID_MAX_SIDE) {
+    const scale = Math.max(
+      ncx / OPEN_GRID_MAX_SIDE,
+      ncy / OPEN_GRID_MAX_SIDE
+    )
+    cs = cs0 * scale
+    ncx = Math.min(
+      OPEN_GRID_MAX_SIDE,
+      Math.max(1, Math.ceil(spanX / cs))
+    )
+    ncy = Math.min(
+      OPEN_GRID_MAX_SIDE,
+      Math.max(1, Math.ceil(spanY / cs))
+    )
+  }
+
+  const midX = (minX + maxX) * 0.5
+  const midY = (minY + maxY) * 0.5
+  const coverX = ncx * cs
+  const coverY = ncy * cs
+  sim.gridOriginX = midX - coverX * 0.5
+  sim.gridOriginY = midY - coverY * 0.5
+  sim.gridCellEff = cs
+
+  if (ncx !== sim.gridDimX || ncy !== sim.gridDimY) {
+    sim.gridDimX = ncx
+    sim.gridDimY = ncy
+    sim.cellHead = new Int32Array(ncx * ncy)
+  }
+}
+
 function rebuildGrid(sim: Sim) {
   sim.cellHead.fill(-1)
   // Safe N prevents writing past typed-array bounds after spec changes.
   const N = Math.min(sim.spec.N, sim.x.length, sim.next.length)
-  const gdim = sim.gridDim
-  for (let i = 0; i < N; i++) {
-    const idx = cellIndexOf(sim.x[i], sim.y[i], gdim)
-    sim.next[i] = sim.cellHead[idx]
-    sim.cellHead[idx] = i
+  if (sim.spec.wrap) {
+    const { gridDimX, gridDimY, worldHalfW, worldHalfH } = sim
+    const worldWidth = 2 * worldHalfW
+    const worldHeight = 2 * worldHalfH
+    for (let i = 0; i < N; i++) {
+      const idx = cellIndexOfTorus(
+        sim.x[i],
+        sim.y[i],
+        worldHalfW,
+        worldHalfH,
+        worldWidth,
+        worldHeight,
+        gridDimX,
+        gridDimY
+      )
+      sim.next[i] = sim.cellHead[idx]
+      sim.cellHead[idx] = i
+    }
+  } else {
+    const { gridDimX, gridDimY, gridOriginX, gridOriginY, gridCellEff } = sim
+    for (let i = 0; i < N; i++) {
+      const idx = cellIndexOfOpen(
+        sim.x[i],
+        sim.y[i],
+        gridOriginX,
+        gridOriginY,
+        gridCellEff,
+        gridDimX,
+        gridDimY
+      )
+      sim.next[i] = sim.cellHead[idx]
+      sim.cellHead[idx] = i
+    }
   }
 }
 // ========================= Physics step =========================
@@ -409,6 +606,11 @@ function step(sim: Sim) {
   const N = Math.min(sp.N, sim.x.length, sim.vx.length, sim.type.length)
   const dt = sp.dt
 
+  const RMAXMX = sim.RMx
+  const maxR = maxRMx(RMAXMX)
+  if (!sp.wrap) {
+    prepareOpenGrid(sim, N, maxR)
+  }
   rebuildGrid(sim)
 
   // Hoist hot fields as monomorphic locals (avoids repeated property lookup).
@@ -421,11 +623,18 @@ function step(sim: Sim) {
   const TYPE = sim.type
   const A = sim.A
   const RMINMX = sim.rMinMx
-  const RMAXMX = sim.RMx
   const cellHead = sim.cellHead
   const linkNext = sim.next
-  const gdim = sim.gridDim
+  const gdx = sim.gridDimX
+  const gdy = sim.gridDimY
+  const whw = sim.worldHalfW
+  const whh = sim.worldHalfH
+  const worldWidth = 2 * whw
+  const worldHeight = 2 * whh
   const wrap = sp.wrap
+  const gOx = sim.gridOriginX
+  const gOy = sim.gridOriginY
+  const gCs = sim.gridCellEff
   const cellSize = sp.cellSize
   const mutualOnly = sp.mutualOnly
   const repel = sp.repel
@@ -435,13 +644,9 @@ function step(sim: Sim) {
   const settleK = sp.settleK
   const cCrit = 2 / dt
   const cSettle = Math.min(Math.max(settleK, 0), cCrit)
-  const invSettleSpan = 1 / Math.max(1e-6, settleR - 0)
 
-  // Cache the per-frame neighbor reach (was being recomputed per-particle).
-  const maxR = maxRMx(RMAXMX)
   const maxR2 = maxR * maxR
-  const reach = Math.max(1, Math.ceil(maxR / cellSize))
-  const halfG = 0.5 * gdim
+  const reach = Math.max(1, Math.ceil(maxR / (wrap ? cellSize : gCs)))
 
   FX.fill(0, 0, N)
   FY.fill(0, 0, N)
@@ -454,10 +659,19 @@ function step(sim: Sim) {
     const RminRi = RMINMX[ti]
     const RmaxRi = RMAXMX[ti]
 
-    const cxi = (xi + 1) * halfG
-    const cyi = (yi + 1) * halfG
-    const cx = cxi < 0 ? 0 : cxi >= gdim ? gdim - 1 : cxi | 0
-    const cy = cyi < 0 ? 0 : cyi >= gdim ? gdim - 1 : cyi | 0
+    let cx: number
+    let cy: number
+    if (wrap) {
+      const cxi = ((xi + whw) / worldWidth) * gdx
+      const cyi = ((yi + whh) / worldHeight) * gdy
+      cx = cxi < 0 ? 0 : cxi >= gdx ? gdx - 1 : cxi | 0
+      cy = cyi < 0 ? 0 : cyi >= gdy ? gdy - 1 : cyi | 0
+    } else {
+      const cxi = (xi - gOx) / gCs
+      const cyi = (yi - gOy) / gCs
+      cx = cxi < 0 ? 0 : cxi >= gdx ? gdx - 1 : cxi | 0
+      cy = cyi < 0 ? 0 : cyi >= gdy ? gdy - 1 : cyi | 0
+    }
 
     let lfx = 0
     let lfy = 0
@@ -465,16 +679,16 @@ function step(sim: Sim) {
     for (let dy = -reach; dy <= reach; dy++) {
       let ny = cy + dy
       if (wrap) {
-        ny = ((ny % gdim) + gdim) % gdim
-      } else if (ny < 0 || ny >= gdim) {
+        ny = ((ny % gdy) + gdy) % gdy
+      } else if (ny < 0 || ny >= gdy) {
         continue
       }
-      const rowBase = ny * gdim
+      const rowBase = ny * gdx
       for (let dx = -reach; dx <= reach; dx++) {
         let nx = cx + dx
         if (wrap) {
-          nx = ((nx % gdim) + gdim) % gdim
-        } else if (nx < 0 || nx >= gdim) {
+          nx = ((nx % gdx) + gdx) % gdx
+        } else if (nx < 0 || nx >= gdx) {
           continue
         }
 
@@ -486,10 +700,10 @@ function step(sim: Sim) {
             let ddx = xj - xi
             let ddy = yj - yi
             if (wrap) {
-              if (ddx > 1) ddx -= WORLD_SIZE
-              else if (ddx < -1) ddx += WORLD_SIZE
-              if (ddy > 1) ddy -= WORLD_SIZE
-              else if (ddy < -1) ddy += WORLD_SIZE
+              if (ddx > worldWidth * 0.5) ddx -= worldWidth
+              else if (ddx < -worldWidth * 0.5) ddx += worldWidth
+              if (ddy > worldHeight * 0.5) ddy -= worldHeight
+              else if (ddy < -worldHeight * 0.5) ddy += worldHeight
             }
             const r2 = ddx * ddx + ddy * ddy
             if (r2 > 0 && r2 <= maxR2) {
@@ -557,8 +771,6 @@ function step(sim: Sim) {
     FX[i] += lfx
     FY[i] += lfy
   }
-  // Suppress lint warnings for cached scalar that is intentionally unused.
-  void invSettleSpan
 
   // integrate
   let maxSpeed2 = 0
@@ -580,28 +792,20 @@ function step(sim: Sim) {
     }
     if (v2 > maxSpeed2) maxSpeed2 = v2
 
-    let nx = X[i] + dt * vxi
-    let ny = Y[i] + dt * vyi
+    const nx = X[i] + dt * vxi
+    const ny = Y[i] + dt * vyi
     if (wrap) {
-      if (nx < -1) nx += WORLD_SIZE
-      else if (nx > 1) nx -= WORLD_SIZE
-      if (ny < -1) ny += WORLD_SIZE
-      else if (ny > 1) ny -= WORLD_SIZE
+      let px = nx
+      let py = ny
+      while (px < -whw) px += worldWidth
+      while (px > whw) px -= worldWidth
+      while (py < -whh) py += worldHeight
+      while (py > whh) py -= worldHeight
+      X[i] = px
+      Y[i] = py
     } else {
-      if (nx < -1) {
-        nx = -1 + (-1 - nx)
-        vxi = Math.abs(vxi)
-      } else if (nx > 1) {
-        nx = 1 - (nx - 1)
-        vxi = -Math.abs(vxi)
-      }
-      if (ny < -1) {
-        ny = -1 + (-1 - ny)
-        vyi = Math.abs(vyi)
-      } else if (ny > 1) {
-        ny = 1 - (ny - 1)
-        vyi = -Math.abs(vyi)
-      }
+      X[i] = nx
+      Y[i] = ny
     }
     VX[i] = vxi
     VY[i] = vyi
@@ -614,19 +818,25 @@ function step(sim: Sim) {
 
 // ========================= Rendering =========================
 function computeViewLayout(widthPx: number, heightPx: number): ViewLayout {
-  const dpr = Math.max(1, (window.devicePixelRatio as number) || 1)
-  const viewSize = Math.min(widthPx, heightPx)
-  const viewX = Math.floor((widthPx - viewSize) / 2)
-  const viewY = Math.floor((heightPx - viewSize) / 2)
-  const scale = viewSize / WORLD_SIZE
+  const dprRaw = (window.devicePixelRatio as number) || 1
+  const dpr = Math.min(2, Math.max(1, dprRaw))
+  const worldHalfH = WORLD_HALF_H
+  const worldHalfW =
+    heightPx > 0 ? (widthPx / heightPx) * worldHalfH : worldHalfH
+  const worldWidth = 2 * worldHalfW
+  const worldHeight = 2 * worldHalfH
   return {
     width: widthPx,
     height: heightPx,
     dpr,
-    viewX,
-    viewY,
-    viewSize,
-    scale,
+    viewX: 0,
+    viewY: 0,
+    viewW: widthPx,
+    viewH: heightPx,
+    worldHalfW,
+    worldHalfH,
+    scaleX: widthPx / worldWidth,
+    scaleY: heightPx / worldHeight,
   }
 }
 
@@ -643,70 +853,161 @@ function setupOverlayCanvas(
   return ctx
 }
 
-function worldToScreen(x: number, y: number, layout: ViewLayout) {
-  const sx = layout.viewX + (x + 1) * 0.5 * layout.viewSize
-  const sy = layout.viewY + (y + 1) * 0.5 * layout.viewSize
+const ZOOM_MIN = 0.12
+const ZOOM_MAX = 80
+
+function worldToScreen(
+  x: number,
+  y: number,
+  layout: ViewLayout,
+  cam: ViewCamera
+) {
+  const hw = layout.worldHalfW / cam.zoom
+  const hh = layout.worldHalfH / cam.zoom
+  const uNorm = (x - (cam.panX - hw)) / (2 * hw)
+  // Match WebGL VS: tv = ((wpos.y - u_cam.y) + hh) / (2*hh)
+  const vNorm = (y - cam.panY + hh) / (2 * hh)
+  const sx = layout.viewX + uNorm * layout.viewW
+  const sy = layout.viewY + vNorm * layout.viewH
   return [sx, sy] as const
 }
 
-function packInterleaved(sim: Sim) {
+/** Cap WebGL point sprites per frame (full N still simulated). */
+const MAX_DRAW_PARTICLES = 200_000
+
+function packInterleaved(sim: Sim): number {
   const N = Math.min(sim.spec.N, sim.x.length, sim.interleaved.length / 3)
   const u = sim.interleaved
-  for (let i = 0; i < N; i++) {
-    const o = i * 3
+  if (N <= MAX_DRAW_PARTICLES) {
+    for (let i = 0; i < N; i++) {
+      const o = i * 3
+      u[o] = sim.x[i]
+      u[o + 1] = sim.y[i]
+      u[o + 2] = sim.type[i]
+    }
+    return N
+  }
+  const stride = Math.max(1, Math.ceil(N / MAX_DRAW_PARTICLES))
+  const phase = sim.frame % stride
+  let w = 0
+  for (let i = phase; i < N; i += stride) {
+    const o = w * 3
     u[o] = sim.x[i]
     u[o + 1] = sim.y[i]
     u[o + 2] = sim.type[i]
+    w++
   }
+  return w
 }
 
 function drawOverlay(
   sim: Sim,
   ctx: CanvasRenderingContext2D,
   layout: ViewLayout,
-  gpuPhysics: boolean
+  cam: ViewCamera,
+  gpuPhysics: boolean,
+  particleDrawN: number,
+  showHud: boolean
 ) {
-  const { width, height, viewX, viewY, viewSize, scale } = layout
-  const { showVel, showGrid } = sim.spec.overlays
-  const N = Math.min(sim.spec.N, sim.x.length)
-
+  const { width, height, viewX, viewY, viewW, viewH } = layout
   ctx.clearRect(0, 0, width, height)
+  if (!showHud) return
+
+  const { showVel, showGrid, showTrailTiles } = sim.spec.overlays
+  const N = Math.min(sim.spec.N, sim.x.length)
+  const hw = layout.worldHalfW / cam.zoom
+  const hh = layout.worldHalfH / cam.zoom
+  const scaleXVis = viewW / (2 * hw)
+  const scaleYVis = viewH / (2 * hh)
 
   if (showGrid) {
     ctx.save()
     ctx.beginPath()
-    ctx.rect(viewX, viewY, viewSize, viewSize)
+    ctx.rect(viewX, viewY, viewW, viewH)
     ctx.clip()
 
     ctx.strokeStyle = "rgba(255,255,255,0.06)"
     ctx.lineWidth = 1
-    const step = (sim.spec.cellSize * viewSize) / WORLD_SIZE
-
-    for (let gx = viewX; gx <= viewX + viewSize + 0.5; gx += step) {
+    const cell = sim.spec.cellSize
+    const xStart = Math.floor((cam.panX - hw) / cell) * cell
+    const yStart = Math.floor((cam.panY - hh) / cell) * cell
+    for (let wx = xStart; wx <= cam.panX + hw + 1e-6; wx += cell) {
+      const [sx0, sy0] = worldToScreen(wx, cam.panY - hh, layout, cam)
+      const [sx1, sy1] = worldToScreen(wx, cam.panY + hh, layout, cam)
       ctx.beginPath()
-      ctx.moveTo(gx, viewY)
-      ctx.lineTo(gx, viewY + viewSize)
+      ctx.moveTo(sx0, sy0)
+      ctx.lineTo(sx1, sy1)
       ctx.stroke()
     }
-    for (let gy = viewY; gy <= viewY + viewSize + 0.5; gy += step) {
+    for (let wy = yStart; wy <= cam.panY + hh + 1e-6; wy += cell) {
+      const [sx0, sy0] = worldToScreen(cam.panX - hw, wy, layout, cam)
+      const [sx1, sy1] = worldToScreen(cam.panX + hw, wy, layout, cam)
       ctx.beginPath()
-      ctx.moveTo(viewX, gy)
-      ctx.lineTo(viewX + viewSize, gy)
+      ctx.moveTo(sx0, sy0)
+      ctx.lineTo(sx1, sy1)
       ctx.stroke()
     }
     ctx.restore()
   }
 
-  if (showVel && N > 0) {
+  if (showTrailTiles && !sim.spec.wrap) {
+    const pointPxCss = 1.75
+    const marginWorld = Math.max(
+      0.06,
+      (pointPxCss / Math.max(layout.viewW, 120)) * (2 * layout.worldHalfW)
+    )
+    const C = OPEN_TRAIL_CHUNK_WORLD
+    const { ix0, ix1, iy0, iy1 } = openTrailVisibleChunkRange(
+      cam,
+      layout.worldHalfW,
+      layout.worldHalfH,
+      marginWorld
+    )
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(viewX, viewY, viewW, viewH)
+    ctx.clip()
+    ctx.strokeStyle = "rgba(0, 220, 180, 0.55)"
+    ctx.lineWidth = 1
+    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+    ctx.fillStyle = "rgba(0, 220, 180, 0.7)"
+    for (let iy = iy0; iy <= iy1; iy++) {
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const wx0 = ix * C
+        const wy0 = iy * C
+        const wx1 = (ix + 1) * C
+        const wy1 = (iy + 1) * C
+        const [sx0, sy0] = worldToScreen(wx0, wy0, layout, cam)
+        const [sx1, sy1] = worldToScreen(wx1, wy0, layout, cam)
+        const [sx2, sy2] = worldToScreen(wx1, wy1, layout, cam)
+        const [sx3, sy3] = worldToScreen(wx0, wy1, layout, cam)
+        ctx.beginPath()
+        ctx.moveTo(sx0, sy0)
+        ctx.lineTo(sx1, sy1)
+        ctx.lineTo(sx2, sy2)
+        ctx.lineTo(sx3, sy3)
+        ctx.closePath()
+        ctx.stroke()
+        const [tlx, tly] = worldToScreen(wx0 + C * 0.02, wy0 + C * 0.02, layout, cam)
+        ctx.fillText(`${ix},${iy}`, tlx, tly)
+      }
+    }
+    ctx.restore()
+  }
+
+  if (showVel && N > 0 && !gpuPhysics) {
     const maxVelDraw = 80_000
     const step = Math.max(1, Math.ceil(N / maxVelDraw))
     ctx.strokeStyle = "rgba(255,255,255,0.35)"
     ctx.lineWidth = 1
     for (let i = 0; i < N; i += step) {
-      const [px, py] = worldToScreen(sim.x[i], sim.y[i], layout)
+      const [px, py] = worldToScreen(sim.x[i], sim.y[i], layout, cam)
       ctx.beginPath()
       ctx.moveTo(px, py)
-      ctx.lineTo(px + sim.vx[i] * scale * 0.15, py + sim.vy[i] * scale * 0.15)
+      ctx.lineTo(
+        px + sim.vx[i] * scaleXVis * 0.15,
+        py + sim.vy[i] * scaleYVis * 0.15
+      )
       ctx.stroke()
     }
   }
@@ -718,10 +1019,10 @@ function drawOverlay(
     .map((v) => v.toFixed(2))
     .join(", ")
   const lines = [
-    `N=${sim.spec.N}  K=${sim.K}  frame=${sim.frame}  WebGL${
+    `N=${sim.spec.N}  sprites=${particleDrawN}  K=${sim.K}  frame=${sim.frame}  WebGL${
       gpuPhysics ? " · WebGPU physics" : " · CPU physics"
     }`,
-    `dt=${sim.spec.dt.toFixed(3)}  vMax=${sim.spec.vMax.toFixed(
+    `dt=${sim.spec.dt.toFixed(3)}  time=${physicsStepsFromSpec(sim.spec)}×  vMax=${sim.spec.vMax.toFixed(
       2
     )}  friction=${sim.spec.friction.toFixed(2)}  wrap=${sim.spec.wrap ? 1 : 0}`,
     `r̂Min=${sim.spec.rMin.toFixed(2)}  R̂=${sim.spec.R.toFixed(
@@ -731,6 +1032,7 @@ function drawOverlay(
       sim.spec.settleEnabled ? 1 : 0
     }  k=${sim.spec.settleK.toFixed(2)}  sR=${sim.spec.settleR.toFixed(2)}`,
     `A[0,*]=[${A0 ?? ""}]`,
+    `view  zoom=${cam.zoom.toFixed(2)}×  pan=(${cam.panX.toFixed(2)}, ${cam.panY.toFixed(2)})`,
   ]
   let ty = viewY + 16
   for (const ln of lines) {
@@ -739,7 +1041,7 @@ function drawOverlay(
   }
 
   ctx.strokeStyle = "rgba(255,255,255,0.08)"
-  ctx.strokeRect(viewX + 0.5, viewY + 0.5, viewSize - 1, viewSize - 1)
+  ctx.strokeRect(viewX + 0.5, viewY + 0.5, viewW - 1, viewH - 1)
 }
 
 // ========================= Matrix Toolbar =========================
@@ -749,7 +1051,7 @@ const RADIUS_PAIR_EPS = 0.002
 
 /**
  * Editable radius bounds in the matrix panel (clamp + randomize).
- * Keep MATRIX_RMAX_HI modest vs WORLD_SIZE (2): large R balloons spatial-hash
+ * Keep MATRIX_RMAX_HI modest vs world vertical span (2): large R balloons spatial-hash
  * neighbor reach (~ceil(maxR/cellSize) cells per axis) and dominates CPU cost.
  */
 const MATRIX_RMIN_LO = 0.01
@@ -794,27 +1096,6 @@ function genRandomRMinTabMatrices(
   return { rMinMx, RMx }
 }
 
-/** Random attraction cutoffs (Max r tab) for fixed min radii. */
-function genRandomRMaxTabMatrix(
-  K: number,
-  rMinMx: number[][],
-  rng: () => number,
-  scalarR: number
-): number[][] {
-  const rMaxCap = clamp(
-    scalarR * 2.25,
-    MATRIX_RMAX_LO + RADIUS_PAIR_EPS,
-    MATRIX_RMAX_HI
-  )
-  return Array.from({ length: K }, (_, i) =>
-    Array.from({ length: K }, (_, j) => {
-      const lo = Math.max(MATRIX_RMAX_LO, rMinMx[i][j] + RADIUS_PAIR_EPS)
-      const hi = clamp(rMaxCap, lo + 1e-4, MATRIX_RMAX_HI)
-      return randRange(rng, lo, hi)
-    })
-  )
-}
-
 /** Clamp LS / legacy matrices so spatial-hash reach stays reasonable (see MATRIX_RMAX_HI). */
 function sanitizeRadiusMatrices(
   rMinMx: number[][],
@@ -834,6 +1115,72 @@ function sanitizeRadiusMatrices(
     }
   }
   return { rMinMx: r1, RMx: r2 }
+}
+
+/** Seeded so first load is stable; bump seed for a different default rule set. */
+const DEFAULT_RULES_BUILD_SEED = 9001
+
+const DEFAULT_SPEC_MATRICES = (() => {
+  const rng = mulberry32(DEFAULT_RULES_BUILD_SEED)
+  const A = genRandomMatrix(DEFAULT_K, rng)
+  const { rMinMx, RMx } = genRandomRMinTabMatrices(
+    DEFAULT_K,
+    rng,
+    DEFAULT_R_MIN,
+    DEFAULT_R_MAX
+  )
+  return { A, rMinMx, RMx }
+})()
+
+/** Default spec: toolbar defaults + random interaction matrices. */
+const SPEC: Spec = {
+  N: 2_500,
+  K: DEFAULT_K,
+  seed: 1337,
+
+  A: cloneMx(DEFAULT_SPEC_MATRICES.A),
+  rMinMx: cloneMx(DEFAULT_SPEC_MATRICES.rMinMx),
+  RMx: cloneMx(DEFAULT_SPEC_MATRICES.RMx),
+  rMin: DEFAULT_R_MIN,
+  R: DEFAULT_R_MAX,
+
+  dt: 1 / 60,
+  friction: 0.02,
+  repel: DEFAULT_REPEL,
+  forceFactor: DEFAULT_FORCE_FACTOR,
+  vMax: 4,
+
+  wrap: false,
+  cellSize: 0.05,
+
+  pixelScale: 800,
+  genMatrix: false,
+
+  overlays: {
+    showVel: false,
+    showGrid: false,
+    showTrails: true,
+    showTrailTiles: false,
+  },
+  trailPersistence: 0.96,
+
+  mutualOnly: false,
+  settleEnabled: false,
+  settleK: 0.01,
+  settleR: 0.08,
+  timeScale: 1,
+}
+
+/** Integer physics substeps per render frame; clamped 1–TIME_SCALE_MAX. */
+const TIME_SCALE_MIN = 1
+const TIME_SCALE_MAX = 50
+
+function physicsStepsFromSpec(sp: Spec): number {
+  return clamp(
+    Math.round(sp.timeScale),
+    TIME_SCALE_MIN,
+    TIME_SCALE_MAX
+  )
 }
 
 function radiusToSwatch(lo: number, hi: number, v: number): string {
@@ -1063,24 +1410,17 @@ function MatrixToolbar({
           type="button"
           onClick={() => {
             const rng = mulberry32(Date.now())
-            if (tab === "forces") {
-              onChangeA(genRandomMatrix(K, rng))
-            } else if (tab === "rmin") {
-              const { rMinMx: nr, RMx: nR } = genRandomRMinTabMatrices(
-                K,
-                rng,
-                scalarRMin,
-                scalarR
-              )
-              onApplyRadii(nr, nR)
-            } else {
-              onApplyRadii(
-                cloneMx(rMinMx),
-                genRandomRMaxTabMatrix(K, rMinMx, rng, scalarR)
-              )
-            }
+            const nextA = genRandomMatrix(K, rng)
+            const { rMinMx: nr, RMx: nR } = genRandomRMinTabMatrices(
+              K,
+              rng,
+              scalarRMin,
+              scalarR
+            )
+            onChangeA(nextA)
+            onApplyRadii(nr, nR)
           }}
-          title="Randomize the current tab (forces or radii)"
+          title="Randomize forces, min r, and max r matrices"
           style={{ ...chipStyle, padding: "4px 8px" }}
         >
           Randomize
@@ -1225,7 +1565,7 @@ function MatrixToolbar({
 }
 
 // ========================= Hooks =========================
-/** WebGL canvas + transparent 2D overlay; square viewport layout in shared `layoutRef`. */
+/** WebGL canvas + transparent 2D overlay; full-area viewport in shared `layoutRef`. */
 function useRendererViewport(simRef: React.MutableRefObject<Sim | null>) {
   const glCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -1286,15 +1626,25 @@ function useRendererViewport(simRef: React.MutableRefObject<Sim | null>) {
 
 // ========================= Component =========================
 export default function App() {
+  const debugHud = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      new URLSearchParams(window.location.search).get("debug") === "1",
+    []
+  )
+
   // Use SPEC directly; do not override A on first render.
   const [spec, setSpec] = useState<Spec>({ ...SPEC })
   const [seed, setSeed] = useState<number>(SPEC.seed)
   const [paused, setPaused] = useState(false)
-  const [showRules, setShowRules] = useState(true)
+  const [showRules, setShowRules] = useState(false)
   const [fps, setFps] = useState(0)
 
   const simRef = useRef<Sim | null>(null)
+  /** Bumps when sim buffer is recreated (reset / spec reinit) so trail state can clear. */
+  const simTrailEpochRef = useRef(0)
   const gpuRunnerRef = useRef<GpuSimRunner | null>(null)
+  const viewCameraRef = useRef<ViewCamera>(defaultViewCamera())
   const [gpuPhysics, setGpuPhysics] = useState(false)
 
   const {
@@ -1305,6 +1655,106 @@ export default function App() {
     particleGLRef,
     overlayCtxRef,
   } = useRendererViewport(simRef)
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const cam = viewCameraRef
+    const layoutRefLocal = layoutRef
+    let dragging = false
+    let lx = 0
+    let ly = 0
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0) return
+      dragging = true
+      lx = e.clientX
+      ly = e.clientY
+      el.style.cursor = "grabbing"
+      try {
+        el.setPointerCapture(e.pointerId)
+      } catch {
+        /* ignore */
+      }
+    }
+    const onPointerMove = (e: PointerEvent) => {
+      if (!dragging) return
+      const dx = e.clientX - lx
+      const dy = e.clientY - ly
+      lx = e.clientX
+      ly = e.clientY
+      const layout = layoutRefLocal.current
+      if (!layout) return
+      const z = cam.current.zoom
+      const hw = layout.worldHalfW / z
+      const hh = layout.worldHalfH / z
+      cam.current.panX -= (dx / layout.viewW) * 2 * hw
+      // Match WebGL VS: tv = ((wpos.y - cam.y) + hh) / (2*hh) (+y → downward on screen).
+      cam.current.panY -= (dy / layout.viewH) * 2 * hh
+    }
+    const endDrag = (e?: PointerEvent) => {
+      dragging = false
+      el.style.cursor = "grab"
+      if (e) {
+        try {
+          el.releasePointerCapture(e.pointerId)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    const onPointerUp = (e: PointerEvent) => {
+      endDrag(e)
+    }
+    const onPointerCancel = () => {
+      dragging = false
+      el.style.cursor = "grab"
+    }
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const layout = layoutRefLocal.current
+      if (!layout) return
+      const rect = el.getBoundingClientRect()
+      const mx = e.clientX - rect.left
+      const my = e.clientY - rect.top
+      const { panX, panY, zoom } = cam.current
+      const hw = layout.worldHalfW / zoom
+      const hh = layout.worldHalfH / zoom
+      const nx = (mx - layout.viewX) / layout.viewW
+      const ny = (my - layout.viewY) / layout.viewH
+      const worldX = panX + (nx - 0.5) * 2 * hw
+      const worldY = panY + (ny - 0.5) * 2 * hh
+      const factor = Math.exp(-e.deltaY * 0.0015)
+      const newZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom * factor))
+      const hw2 = layout.worldHalfW / newZoom
+      const hh2 = layout.worldHalfH / newZoom
+      cam.current.panX = worldX - (nx - 0.5) * 2 * hw2
+      cam.current.panY = worldY - (ny - 0.5) * 2 * hh2
+      cam.current.zoom = newZoom
+    }
+    const onDblClick = () => {
+      cam.current = defaultViewCamera()
+    }
+
+    el.style.cursor = "grab"
+    el.style.touchAction = "none"
+    el.addEventListener("pointerdown", onPointerDown)
+    el.addEventListener("pointermove", onPointerMove)
+    el.addEventListener("pointerup", onPointerUp)
+    el.addEventListener("pointercancel", onPointerCancel)
+    el.addEventListener("lostpointercapture", onPointerCancel)
+    el.addEventListener("wheel", onWheel, { passive: false })
+    el.addEventListener("dblclick", onDblClick)
+    return () => {
+      el.removeEventListener("pointerdown", onPointerDown)
+      el.removeEventListener("pointermove", onPointerMove)
+      el.removeEventListener("pointerup", onPointerUp)
+      el.removeEventListener("pointercancel", onPointerCancel)
+      el.removeEventListener("lostpointercapture", onPointerCancel)
+      el.removeEventListener("wheel", onWheel)
+      el.removeEventListener("dblclick", onDblClick)
+    }
+  }, [containerRef, layoutRef])
 
   // -------- Resolve matrices when K changes or genMatrix is set.
   useEffect(() => {
@@ -1332,8 +1782,14 @@ export default function App() {
       return
     }
 
-    const A = genRingPreset(spec.K)
-    const { rMinMx, RMx } = genRingRadiusPreset(spec.K, spec.rMin, spec.R)
+    const rng = mulberry32(Date.now())
+    const A = genRandomMatrix(spec.K, rng)
+    const { rMinMx, RMx } = genRandomRMinTabMatrices(
+      spec.K,
+      rng,
+      spec.rMin,
+      spec.R
+    )
     setSpec((s) => ({
       ...s,
       A,
@@ -1343,19 +1799,42 @@ export default function App() {
     }))
   }, [spec.K, spec.genMatrix])
 
-  // -------- WebGPU physics (optional; depends on cellSize for grid buffer cap).
+  // -------- Initialize / Re-initialize simulation when core layout changes.
+  useEffect(() => {
+    simRef.current = initSim(spec, seed)
+    simTrailEpochRef.current++
+    viewCameraRef.current = defaultViewCamera()
+    gpuRunnerRef.current?.uploadParticleState(simRef.current)
+  }, [
+    seed,
+    spec.N,
+    spec.K,
+    spec.cellSize,
+    spec.wrap,
+    spec.rMin,
+    spec.R,
+    spec.dt,
+    spec.friction,
+    spec.vMax,
+  ])
+
+  // -------- WebGPU physics: toroidal domain only (GPU matches fixed world_half bounce/wrap).
   useEffect(() => {
     let cancelled = false
     setGpuPhysics(false)
-    if (!ENABLE_WEBGPU_PHYSICS) return
-    const gridDim = Math.max(1, Math.ceil(WORLD_SIZE / spec.cellSize))
+    gpuRunnerRef.current?.dispose()
+    gpuRunnerRef.current = null
+    if (!ENABLE_WEBGPU_PHYSICS || !spec.wrap) return
+
     void (async () => {
-      const runner = await createGpuSimRunner(MAX_PARTICLES + 50_000, gridDim)
+      const runner = await createGpuSimRunner(
+        MAX_PARTICLES + 50_000,
+        maxGridCellsForCellSize(spec.cellSize)
+      )
       if (cancelled) {
         runner?.dispose()
         return
       }
-      gpuRunnerRef.current?.dispose()
       gpuRunnerRef.current = runner
       const sim = simRef.current
       if (runner && sim) {
@@ -1370,24 +1849,7 @@ export default function App() {
       gpuRunnerRef.current?.dispose()
       gpuRunnerRef.current = null
     }
-  }, [spec.cellSize])
-
-  // -------- Initialize / Re-initialize simulation when core layout changes.
-  useEffect(() => {
-    simRef.current = initSim(spec, seed)
-    gpuRunnerRef.current?.uploadParticleState(simRef.current)
-  }, [
-    seed,
-    spec.N,
-    spec.K,
-    spec.cellSize,
-    spec.wrap,
-    spec.rMin,
-    spec.R,
-    spec.dt,
-    spec.friction,
-    spec.vMax,
-  ])
+  }, [spec.cellSize, spec.wrap])
 
   // keep runtime sim reading latest spec without forcing reset
   useEffect(() => {
@@ -1410,29 +1872,54 @@ export default function App() {
         return
       }
 
+      syncSimWorldToLayout(sim, layout)
+
       if (!paused) {
+        const k = physicsStepsFromSpec(sim.spec)
         const gpu = gpuRunnerRef.current
-        if (gpu && gpuPhysics) {
-          // Grid is built on GPU; skip CPU rebuildGrid and avoid uploads.
+        const useGpu = gpu && gpuPhysics && sim.spec.wrap
+        if (useGpu) {
+          gpu.subSteps = k
           gpu.step(sim)
         } else {
-          step(sim)
+          for (let s = 0; s < k; s++) {
+            step(sim)
+          }
         }
       }
 
       const n = Math.min(sim.spec.N, sim.x.length)
       ensureParticleBufferCapacity(pr, n)
-      packInterleaved(sim)
+      const drawN = packInterleaved(sim)
+      const stride =
+        drawN > 0 && n > drawN ? Math.max(1, Math.ceil(n / drawN)) : 1
+      const pointPxCss =
+        stride > 2 ? 1.05 : stride > 1 ? 1.25 : n > 400_000 ? 1.2 : 1.75
       drawParticles(
         pr,
         sim.interleaved,
-        n,
+        drawN,
         layout,
+        viewCameraRef.current,
         sim.K,
         TYPE_COLORS,
-        n > 400_000 ? 1.2 : 1.75
+        pointPxCss,
+        {
+          trails: sim.spec.overlays.showTrails,
+          trailPersistence: sim.spec.trailPersistence,
+          tileWrap: sim.spec.wrap,
+          trailHistKey: simTrailEpochRef.current,
+        }
       )
-      drawOverlay(sim, octx, layout, gpuPhysics)
+      drawOverlay(
+        sim,
+        octx,
+        layout,
+        viewCameraRef.current,
+        gpuPhysics && sim.spec.wrap,
+        drawN,
+        debugHud
+      )
 
       raf = requestAnimationFrame(tick)
     }
@@ -1442,10 +1929,11 @@ export default function App() {
       stopped = true
       cancelAnimationFrame(raf)
     }
-  }, [paused, gpuPhysics])
+  }, [paused, gpuPhysics, debugHud])
 
-  // FPS meter
+  // FPS meter (header only in debug HUD mode)
   useEffect(() => {
+    if (!debugHud) return
     let last = performance.now(),
       frames = 0,
       raf = 0 as unknown as number
@@ -1461,7 +1949,7 @@ export default function App() {
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [])
+  }, [debugHud])
 
   // persist interaction rules
   useEffect(() => {
@@ -1504,6 +1992,8 @@ export default function App() {
   const togglePause = () => setPaused((p) => !p)
   const handleReset = () => {
     simRef.current = initSim(spec, seed)
+    simTrailEpochRef.current++
+    viewCameraRef.current = defaultViewCamera()
     gpuRunnerRef.current?.uploadParticleState(simRef.current)
   }
   const handleRandomizeSeed = () => setSeed(Math.floor(Math.random() * 1e9))
@@ -1543,7 +2033,7 @@ export default function App() {
     <div
       style={{
         display: "grid",
-        gridTemplateRows: "auto 1fr auto",
+        gridTemplateRows: debugHud ? "auto 1fr auto" : "1fr",
         minHeight: "100vh",
         background: "#0a0a0a",
         color: "#eaeaea",
@@ -1551,7 +2041,8 @@ export default function App() {
           "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial",
       }}
     >
-      {/* Header */}
+      {/* Header (debug only) */}
+      {debugHud && (
       <div style={{ padding: "12px 16px", borderBottom: "1px solid #222" }}>
         <div
           style={{
@@ -1647,6 +2138,51 @@ export default function App() {
                 }
               />
               Grid
+            </label>
+            <label
+              style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+              title="Fading motion trails (GPU: previous frame retained with fade)"
+            >
+              <input
+                type="checkbox"
+                checked={spec.overlays.showTrails}
+                onChange={(e) =>
+                  setSpec({
+                    ...spec,
+                    overlays: { ...spec.overlays, showTrails: e.target.checked },
+                  })
+                }
+              />
+              Trails
+            </label>
+            <label
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                opacity: spec.wrap ? 0.5 : 1,
+              }}
+              title={
+                spec.wrap
+                  ? "Trail chunk tiles apply to open world only (disable Wrap)"
+                  : "Show trail buffer chunk boundaries (open-world GPU tiles)"
+              }
+            >
+              <input
+                type="checkbox"
+                disabled={spec.wrap}
+                checked={!!spec.overlays.showTrailTiles}
+                onChange={(e) =>
+                  setSpec({
+                    ...spec,
+                    overlays: {
+                      ...spec.overlays,
+                      showTrailTiles: e.target.checked,
+                    },
+                  })
+                }
+              />
+              Trail tiles
             </label>
             <label
               style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
@@ -1760,6 +2296,106 @@ export default function App() {
             <div
               style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
             >
+              <span
+                style={{ opacity: 0.7 }}
+                title="Physics steps per frame (simulation time speed)"
+              >
+                time:
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    timeScale: inc(s.timeScale, -5, TIME_SCALE_MIN, TIME_SCALE_MAX),
+                  }))
+                }
+                style={chipStyle}
+                title="−5×"
+              >
+                −5
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    timeScale: inc(s.timeScale, -1, TIME_SCALE_MIN, TIME_SCALE_MAX),
+                  }))
+                }
+                style={chipStyle}
+                title="−1×"
+              >
+                −
+              </button>
+              <span>{physicsStepsFromSpec(spec)}×</span>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    timeScale: inc(s.timeScale, +1, TIME_SCALE_MIN, TIME_SCALE_MAX),
+                  }))
+                }
+                style={chipStyle}
+                title="+1×"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    timeScale: inc(s.timeScale, +5, TIME_SCALE_MIN, TIME_SCALE_MAX),
+                  }))
+                }
+                style={chipStyle}
+                title="+5×"
+              >
+                +5
+              </button>
+            </div>
+
+            <div
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
+              <span
+                style={{ opacity: 0.7 }}
+                title="Trail persistence per frame (higher = longer fading tail)"
+              >
+                trail:
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    trailPersistence: inc(s.trailPersistence, -0.02, 0.75, 0.98),
+                  }))
+                }
+                style={chipStyle}
+              >
+                −
+              </button>
+              <span>{spec.trailPersistence.toFixed(2)}</span>
+              <button
+                type="button"
+                onClick={() =>
+                  setSpec((s) => ({
+                    ...s,
+                    trailPersistence: inc(s.trailPersistence, +0.02, 0.75, 0.98),
+                  }))
+                }
+                style={chipStyle}
+              >
+                +
+              </button>
+            </div>
+
+            <div
+              style={{ display: "inline-flex", gap: 6, alignItems: "center" }}
+            >
               <span style={{ opacity: 0.7 }}>sR:</span>
               <button
                 onClick={() =>
@@ -1796,6 +2432,7 @@ export default function App() {
           </button>
         </div>
       </div>
+      )}
 
       {/* Canvas area (middle row) */}
       <div
@@ -1831,7 +2468,8 @@ export default function App() {
         />
       </div>
 
-      {/* Footer */}
+      {/* Footer (debug only) */}
+      {debugHud && (
       <div
         style={{
           padding: "10px 16px",
@@ -1843,13 +2481,17 @@ export default function App() {
         <span style={{ opacity: 0.85 }}>
           rMinPreset={spec.rMin.toFixed(2)} · Rpreset=
           {spec.R.toFixed(2)} · Rmax={maxRMx(spec.RMx).toFixed(2)} · dt=
-          {spec.dt} · friction={spec.friction.toFixed(2)} · vMax={spec.vMax} ·
+          {spec.dt} · time={physicsStepsFromSpec(spec)}× · friction={spec.friction.toFixed(2)} · vMax={spec.vMax} ·
           cell={spec.cellSize} · seed={seed}
         </span>
+        <span style={{ opacity: 0.65, marginLeft: 12 }}>
+          Drag to pan · wheel zoom · double-click reset view
+        </span>
       </div>
+      )}
 
       {/* Rules toolbar */}
-      {showRules && (
+      {debugHud && showRules && (
         <MatrixToolbar
           K={spec.K}
           A={spec.A}

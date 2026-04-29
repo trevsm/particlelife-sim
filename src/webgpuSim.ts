@@ -1,8 +1,8 @@
 import type { Sim } from "./simTypes"
 
-const MAX_K = 16
+const MAX_K = 50
 const UNIFORM_BYTE_LENGTH = 256
-const READBACK_RING_COUNT = 2
+const READBACK_RING_COUNT = 3
 const FORCE_UNIT_SCALE = 2 / 1280
 
 function maxRMx(RMx: number[][]): number {
@@ -19,14 +19,14 @@ function maxRMx(RMx: number[][]): number {
  *  One bind group; spatial grid is a GPU-built atomic linked list (no CPU upload).
  */
 const SIM_SHADER = `
-const MAX_K: u32 = 16u;
+const MAX_K: u32 = 50u;
 const FSCALE: f32 = 65536.0;
-const WORLD_SZ: f32 = 2.0;
 
 struct Uni {
   n: u32,
   k: u32,
-  grid_dim: u32,
+  grid_dim_x: u32,
+  grid_dim_y: u32,
   cells: u32,
   reach: u32,
   dt: f32,
@@ -38,6 +38,8 @@ struct Uni {
   settle_k: f32,
   flags: u32,
   _pa: u32,
+  world_half_x: f32,
+  world_half_y: f32,
 }
 
 @group(0) @binding(0) var<uniform> uni: Uni;
@@ -67,16 +69,29 @@ fn accel_mag(a: f32, r: f32, r_min: f32, r_max: f32, repel: f32) -> f32 {
   return a * (1.0 - abs(r_min + r_max - 2.0 * r) / denom);
 }
 
-fn torus_delta(a: f32, b: f32) -> f32 {
+fn torus_delta_x(a: f32, b: f32) -> f32 {
   var d = b - a;
-  if (d > 1.0) { d = d - WORLD_SZ; }
-  else if (d < -1.0) { d = d + WORLD_SZ; }
+  let period = uni.world_half_x * 2.0;
+  let half_p = period * 0.5;
+  if (d > half_p) { d = d - period; }
+  else if (d < -half_p) { d = d + period; }
   return d;
 }
 
-fn cell_xy(x: f32, y: f32, gd: u32) -> vec2<u32> {
-  let gx = u32(clamp_f(floor((x + 1.0) * 0.5 * f32(gd)), 0.0, f32(gd) - 1.0));
-  let gy = u32(clamp_f(floor((y + 1.0) * 0.5 * f32(gd)), 0.0, f32(gd) - 1.0));
+fn torus_delta_y(a: f32, b: f32) -> f32 {
+  var d = b - a;
+  let period = uni.world_half_y * 2.0;
+  let half_p = period * 0.5;
+  if (d > half_p) { d = d - period; }
+  else if (d < -half_p) { d = d + period; }
+  return d;
+}
+
+fn cell_xy(x: f32, y: f32, gdx: u32, gdy: u32) -> vec2<u32> {
+  let wx = uni.world_half_x * 2.0;
+  let wy = uni.world_half_y * 2.0;
+  let gx = u32(clamp_f(floor((x + uni.world_half_x) / wx * f32(gdx)), 0.0, f32(gdx) - 1.0));
+  let gy = u32(clamp_f(floor((y + uni.world_half_y) / wy * f32(gdy)), 0.0, f32(gdy) - 1.0));
   return vec2<u32>(gx, gy);
 }
 
@@ -108,8 +123,8 @@ fn clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn build_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= uni.n) { return; }
-  let cc = cell_xy(pos[i].x, pos[i].y, uni.grid_dim);
-  let cidx = cc.x + cc.y * uni.grid_dim;
+  let cc = cell_xy(pos[i].x, pos[i].y, uni.grid_dim_x, uni.grid_dim_y);
+  let cidx = cc.x + cc.y * uni.grid_dim_x;
   let prev = atomicExchange(&cell_head[cidx], i32(i));
   link_next[i] = prev;
 }
@@ -127,7 +142,8 @@ fn apply_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= uni.n) { return; }
 
-  let gd = uni.grid_dim;
+  let gdx = uni.grid_dim_x;
+  let gdy = uni.grid_dim_y;
   let reach = i32(uni.reach);
   let wrap = (uni.flags & 1u) != 0u;
   let mutual_only = (uni.flags & 2u) != 0u;
@@ -143,7 +159,7 @@ fn apply_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
   var lfx = 0.0;
   var lfy = 0.0;
 
-  let cc = cell_xy(xi, yi, gd);
+  let cc = cell_xy(xi, yi, gdx, gdy);
   let cx = i32(cc.x);
   let cy = i32(cc.y);
 
@@ -152,12 +168,12 @@ fn apply_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
       var nx = cx + dx;
       var ny = cy + dy;
       if (wrap) {
-        nx = imod(nx, i32(gd));
-        ny = imod(ny, i32(gd));
+        nx = imod(nx, i32(gdx));
+        ny = imod(ny, i32(gdy));
       } else {
-        if (nx < 0 || ny < 0 || nx >= i32(gd) || ny >= i32(gd)) { continue; }
+        if (nx < 0 || ny < 0 || nx >= i32(gdx) || ny >= i32(gdy)) { continue; }
       }
-      let cidx = u32(nx) + u32(ny) * gd;
+      let cidx = u32(nx) + u32(ny) * gdx;
 
       var cur = atomicLoad(&cell_head[cidx]);
       while (cur != -1) {
@@ -166,8 +182,8 @@ fn apply_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
           var dxp = pos[j].x - xi;
           var dyp = pos[j].y - yi;
           if (wrap) {
-            dxp = torus_delta(xi, pos[j].x);
-            dyp = torus_delta(yi, pos[j].y);
+            dxp = torus_delta_x(xi, pos[j].x);
+            dyp = torus_delta_y(yi, pos[j].y);
           }
 
           let r2 = dxp * dxp + dyp * dyp;
@@ -257,26 +273,31 @@ fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
   var x = pos[i].x + dt * vx;
   var y = pos[i].y + dt * vy;
 
+  let whx = uni.world_half_x;
+  let why = uni.world_half_y;
+  let fwx = whx * 2.0;
+  let fwy = why * 2.0;
+
   if (wrap) {
-    if (x < -1.0) { x = x + WORLD_SZ; }
-    if (x > 1.0) { x = x - WORLD_SZ; }
-    if (y < -1.0) { y = y + WORLD_SZ; }
-    if (y > 1.0) { y = y - WORLD_SZ; }
+    if (x < -whx) { x = x + fwx; }
+    if (x > whx) { x = x - fwx; }
+    if (y < -why) { y = y + fwy; }
+    if (y > why) { y = y - fwy; }
   } else {
-    if (x < -1.0) {
-      x = -1.0 + (-1.0 - x);
+    if (x < -whx) {
+      x = -whx + (-whx - x);
       vx = abs(vx);
     }
-    if (x > 1.0) {
-      x = 1.0 - (x - 1.0);
+    if (x > whx) {
+      x = whx - (x - whx);
       vx = -abs(vx);
     }
-    if (y < -1.0) {
-      y = -1.0 + (-1.0 - y);
+    if (y < -why) {
+      y = -why + (-why - y);
       vy = abs(vy);
     }
-    if (y > 1.0) {
-      y = 1.0 - (y - 1.0);
+    if (y > why) {
+      y = why - (y - why);
       vy = -abs(vy);
     }
   }
@@ -296,7 +317,9 @@ function packUniform(sim: Sim, N: number, cells: number): ArrayBuffer {
   o += 4
   dv.setUint32(o, sim.K, true)
   o += 4
-  dv.setUint32(o, sim.gridDim, true)
+  dv.setUint32(o, sim.gridDimX, true)
+  o += 4
+  dv.setUint32(o, sim.gridDimY, true)
   o += 4
   dv.setUint32(o, cells, true)
   o += 4
@@ -323,6 +346,10 @@ function packUniform(sim: Sim, N: number, cells: number): ArrayBuffer {
   dv.setUint32(o, flags, true)
   o += 4
   dv.setUint32(o, 0, true)
+  o += 4
+  dv.setFloat32(o, sim.worldHalfW, true)
+  o += 4
+  dv.setFloat32(o, sim.worldHalfH, true)
   o += 4
   return buf
 }
@@ -560,7 +587,7 @@ export class GpuSimRunner {
       size: szU32,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    const readbackBytes = szVec * 2
+    const readbackBytes = szVec
     const readbackBufs: GPUBuffer[] = []
     for (let i = 0; i < READBACK_RING_COUNT; i++) {
       readbackBufs.push(
@@ -652,7 +679,7 @@ export class GpuSimRunner {
     for (const b of this.readbackBufs) b.destroy()
   }
 
-  /** One physics step. Sync; readback is fire-and-forget into sim.x/y/vx/vy. */
+  /** One physics step. Sync; readback copies positions only (half bandwidth) into sim.x/y. */
   step(sim: Sim): void {
     const N = Math.min(
       sim.spec.N,
@@ -661,7 +688,7 @@ export class GpuSimRunner {
       sim.type.length,
       this.capN
     )
-    const cells = sim.gridDim * sim.gridDim
+    const cells = sim.gridDimX * sim.gridDimY
     if (cells > this.capCells) {
       console.warn("GpuSimRunner: grid overflow, skipping GPU step")
       return
@@ -767,7 +794,6 @@ export class GpuSimRunner {
     if (rbIdx >= 0) {
       const rbBuf = this.readbackBufs[rbIdx]
       encoder.copyBufferToBuffer(this.posBuf, 0, rbBuf, 0, N * 8)
-      encoder.copyBufferToBuffer(this.velBuf, 0, rbBuf, N * 8, N * 8)
     }
     this.queue.submit([encoder.finish()])
 
@@ -782,19 +808,11 @@ export class GpuSimRunner {
           try {
             const slice = buf.getMappedRange()
             const raw = new Float32Array(slice)
-            const lim = Math.min(N2, sim.x.length, sim.vx.length)
-            let maxSpeed = 0
+            const lim = Math.min(N2, sim.x.length)
             for (let i = 0; i < lim; i++) {
               sim.x[i] = raw[i * 2]
               sim.y[i] = raw[i * 2 + 1]
-              const vx = raw[N2 * 2 + i * 2]
-              const vy = raw[N2 * 2 + i * 2 + 1]
-              sim.vx[i] = vx
-              sim.vy[i] = vy
-              const s2 = vx * vx + vy * vy
-              if (s2 > maxSpeed) maxSpeed = s2
             }
-            sim.lastMaxSpeed = Math.sqrt(maxSpeed)
             buf.unmap()
           } catch {
             // buffer may have been destroyed mid-flight; nothing to do
@@ -806,17 +824,16 @@ export class GpuSimRunner {
           this.readbackInflight[rbIdx] = false
         })
     }
-    sim.frame++
+    sim.frame += subSteps
   }
 }
 
 export async function createGpuSimRunner(
   maxN: number,
-  maxGridDim: number
+  maxGridCells: number
 ): Promise<GpuSimRunner | null> {
-  const gridCells = maxGridDim * maxGridDim
   try {
-    return await GpuSimRunner.create(maxN, gridCells)
+    return await GpuSimRunner.create(maxN, maxGridCells)
   } catch (e) {
     console.warn("WebGPU sim unavailable:", e)
     return null
