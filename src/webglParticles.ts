@@ -12,7 +12,8 @@ export type ViewCamera = {
 export const defaultViewCamera = (): ViewCamera => ({
   panX: 0,
   panY: 0,
-  zoom: 1,
+  /** <1 zooms out (more world visible); 1 fits fundamental cell to view. */
+  zoom: 0.85,
 })
 
 export type ViewLayout = {

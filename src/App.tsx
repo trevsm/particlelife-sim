@@ -315,26 +315,43 @@ function loadRulesFromLS(
 }
 
 // ========================= Simulation state =========================
-function initSim(spec: Spec, seedOverride?: number): Sim {
+
+type InitSimResult = {
+  sim: Sim
+  /** Merge into React `spec` when rules were randomly drawn (non-localStorage). */
+  specPatch?: Pick<Spec, "A" | "rMinMx" | "RMx" | "genMatrix">
+}
+
+function initSim(
+  spec: Spec,
+  seedOverride?: number,
+  opts?: { rerollInteractionRules?: boolean }
+): InitSimResult {
+  const reroll = opts?.rerollInteractionRules ?? false
   const rng = mulberry32(seedOverride ?? spec.seed)
   const K = spec.K
 
-  // choose rules: localStorage → random (genMatrix) → spec matrices
+  // choose rules: localStorage → random (genMatrix / reroll) → spec matrices
   const loaded = loadRulesFromLS(K, spec.rMin, spec.R)
   let A: number[][]
   let rMinMx: number[][]
   let RMx: number[][]
+  let usedRandomRules = false
+
   if (loaded) {
     A = loaded.A
     const sane = sanitizeRadiusMatrices(loaded.rMinMx, loaded.RMx)
     rMinMx = sane.rMinMx
     RMx = sane.RMx
-  } else if (spec.genMatrix) {
-    const rng = mulberry32(seedOverride ?? spec.seed)
-    A = genRandomMatrix(K, rng)
-    const rm = genRandomRMinTabMatrices(K, rng, spec.rMin, spec.R)
+  } else if (spec.genMatrix || reroll) {
+    const rulesSalt =
+      (Date.now() ^ ((seedOverride ?? spec.seed) * 2654435761)) >>> 0
+    const rngRules = mulberry32(rulesSalt)
+    A = genRandomMatrix(K, rngRules)
+    const rm = genRandomRMinTabMatrices(K, rngRules, spec.rMin, spec.R)
     rMinMx = rm.rMinMx
     RMx = rm.RMx
+    usedRandomRules = true
   } else {
     A = spec.A
     const ring = genRingRadiusPreset(K, spec.rMin, spec.R)
@@ -430,32 +447,44 @@ function initSim(spec: Spec, seedOverride?: number): Sim {
     cellHead = new Int32Array(ncx * ncy)
   }
 
+  const specPatch: InitSimResult["specPatch"] = usedRandomRules
+    ? {
+        A: cloneMx(A),
+        rMinMx: cloneMx(rMinMx),
+        RMx: cloneMx(RMx),
+        genMatrix: false,
+      }
+    : undefined
+
   return {
-    spec,
-    K,
-    x,
-    y,
-    vx,
-    vy,
-    type,
-    interleaved,
-    fx: new Float32Array(spec.N),
-    fy: new Float32Array(spec.N),
-    worldHalfW,
-    worldHalfH,
-    gridDimX,
-    gridDimY,
-    cellHead,
-    next,
-    rng,
-    frame: 0,
-    lastMaxSpeed: 0,
-    A: cloneMx(A),
-    rMinMx: cloneMx(rMinMx),
-    RMx: cloneMx(RMx),
-    gridOriginX,
-    gridOriginY,
-    gridCellEff,
+    sim: {
+      spec,
+      K,
+      x,
+      y,
+      vx,
+      vy,
+      type,
+      interleaved,
+      fx: new Float32Array(spec.N),
+      fy: new Float32Array(spec.N),
+      worldHalfW,
+      worldHalfH,
+      gridDimX,
+      gridDimY,
+      cellHead,
+      next,
+      rng,
+      frame: 0,
+      lastMaxSpeed: 0,
+      A: cloneMx(A),
+      rMinMx: cloneMx(rMinMx),
+      RMx: cloneMx(RMx),
+      gridOriginX,
+      gridOriginY,
+      gridCellEff,
+    },
+    specPatch,
   }
 }
 
@@ -1136,7 +1165,7 @@ const DEFAULT_SPEC_MATRICES = (() => {
 const SPEC: Spec = {
   N: 2_500,
   K: DEFAULT_K,
-  seed: 1337,
+  seed: 1337, // overwritten on load by random `seed` state; kept for saved-spec shape
 
   A: cloneMx(DEFAULT_SPEC_MATRICES.A),
   rMinMx: cloneMx(DEFAULT_SPEC_MATRICES.rMinMx),
@@ -1624,6 +1653,11 @@ function useRendererViewport(simRef: React.MutableRefObject<Sim | null>) {
   }
 }
 
+/** New placement + rules salt on each full page load (React state seed is random). */
+function randomParticleSeed(): number {
+  return Math.floor(Math.random() * 1e9)
+}
+
 // ========================= Component =========================
 export default function App() {
   const debugHud = useMemo(
@@ -1635,7 +1669,7 @@ export default function App() {
 
   // Use SPEC directly; do not override A on first render.
   const [spec, setSpec] = useState<Spec>({ ...SPEC })
-  const [seed, setSeed] = useState<number>(SPEC.seed)
+  const [seed, setSeed] = useState<number>(() => randomParticleSeed())
   const [paused, setPaused] = useState(false)
   const [showRules, setShowRules] = useState(false)
   const [fps, setFps] = useState(0)
@@ -1643,6 +1677,8 @@ export default function App() {
   const simRef = useRef<Sim | null>(null)
   /** Bumps when sim buffer is recreated (reset / spec reinit) so trail state can clear. */
   const simTrailEpochRef = useRef(0)
+  /** Tracks seed seen by physics reinit so we reroll interaction rules on seed change, not on dt/friction tweaks. */
+  const lastInitSeedRef = useRef<number | undefined>(undefined)
   const gpuRunnerRef = useRef<GpuSimRunner | null>(null)
   const viewCameraRef = useRef<ViewCamera>(defaultViewCamera())
   const [gpuPhysics, setGpuPhysics] = useState(false)
@@ -1655,6 +1691,11 @@ export default function App() {
     particleGLRef,
     overlayCtxRef,
   } = useRendererViewport(simRef)
+
+  // Keep `spec.seed` aligned with sim placement seed (footer, exports, saves).
+  useEffect(() => {
+    setSpec((s) => (s.seed === seed ? s : { ...s, seed }))
+  }, [seed])
 
   useEffect(() => {
     const el = containerRef.current
@@ -1801,7 +1842,15 @@ export default function App() {
 
   // -------- Initialize / Re-initialize simulation when core layout changes.
   useEffect(() => {
-    simRef.current = initSim(spec, seed)
+    const firstInit = lastInitSeedRef.current === undefined
+    const seedChanged = lastInitSeedRef.current !== seed
+    lastInitSeedRef.current = seed
+    const rerollInteractionRules = firstInit || seedChanged
+    const { sim, specPatch } = initSim(spec, seed, {
+      rerollInteractionRules,
+    })
+    simRef.current = sim
+    if (specPatch) setSpec((s) => ({ ...s, ...specPatch }))
     simTrailEpochRef.current++
     viewCameraRef.current = defaultViewCamera()
     gpuRunnerRef.current?.uploadParticleState(simRef.current)
@@ -1991,7 +2040,11 @@ export default function App() {
   // handlers
   const togglePause = () => setPaused((p) => !p)
   const handleReset = () => {
-    simRef.current = initSim(spec, seed)
+    const { sim, specPatch } = initSim(spec, seed, {
+      rerollInteractionRules: true,
+    })
+    simRef.current = sim
+    if (specPatch) setSpec((s) => ({ ...s, ...specPatch }))
     simTrailEpochRef.current++
     viewCameraRef.current = defaultViewCamera()
     gpuRunnerRef.current?.uploadParticleState(simRef.current)
