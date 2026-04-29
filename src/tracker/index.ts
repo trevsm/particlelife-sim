@@ -10,6 +10,12 @@ export {
   type TrackerSnapshot,
 } from "./types"
 export { detectClusters } from "./cluster"
-export { jaccard, overlapFraction, computeStability, computeScore } from "./stability"
+export {
+  jaccard,
+  overlapFraction,
+  symmetryScore,
+  computeStability,
+  computeScore,
+} from "./stability"
 export { colloquialName, engineeringSignature, hashHistogram } from "./naming"
 export { renderThumbnail, THUMBNAIL_SIZE, type ThumbnailViewport } from "./thumbnail"

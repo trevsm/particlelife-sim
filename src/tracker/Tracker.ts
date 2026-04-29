@@ -37,6 +37,16 @@ import {
   type TrackerSnapshot,
 } from "./types"
 
+function meanSample(arr: number[]): number {
+  if (arr.length === 0) return 0
+  let s = 0
+  for (let i = 0; i < arr.length; i++) s += arr[i]
+  return s / arr.length
+}
+
+/** Live HUD thumbnails: target refresh rate vs animation frames (tracker step is slower). */
+const HUD_THUMB_INTERVAL_MS = 1000 / 30
+
 export class OrganismTracker {
   params: TrackerParams
   alive: Map<number, Organism> = new Map()
@@ -46,6 +56,8 @@ export class OrganismTracker {
   private trackerStep = 0
   private framesSinceStep = 0
   private lastSimFrame = 0
+  /** Wall clock: throttle HUD thumbnail rasterization. */
+  private lastHudThumbWallMs = 0
   private colors: string[]
 
   constructor(colors: string[], params: Partial<TrackerParams> = {}) {
@@ -59,17 +71,50 @@ export class OrganismTracker {
     this.nextId = 1
     this.trackerStep = 0
     this.framesSinceStep = 0
+    this.lastHudThumbWallMs = 0
   }
 
-  /** Call once per animation frame. Subsamples internally. */
-  observe(sim: Sim, thumbnailViewport?: ThumbnailViewport) {
+  /**
+   * Call once per animation frame while the sim runs.
+   * Refreshes live HUD thumbnails (~30fps) independently of tracker cluster steps.
+   */
+  observe(
+    sim: Sim,
+    thumbnailViewport?: ThumbnailViewport,
+    opts?: { skipHudThumbnails?: boolean }
+  ) {
+    if (!opts?.skipHudThumbnails) {
+      this.refreshHudThumbnails(sim, thumbnailViewport)
+    }
     this.framesSinceStep++
     if (this.framesSinceStep < this.params.framesPerStep) return
     this.framesSinceStep = 0
-    this.step(sim, thumbnailViewport)
+    this.step(sim)
   }
 
-  private step(sim: Sim, thumbnailViewport?: ThumbnailViewport) {
+  /** Top-N listed competitors: live view at ~30fps using current particle positions. */
+  private refreshHudThumbnails(sim: Sim, vp?: ThumbnailViewport) {
+    if (!vp || this.alive.size === 0) return
+    const now =
+      typeof performance !== "undefined" ? performance.now() : 0
+    if (now - this.lastHudThumbWallMs < HUD_THUMB_INTERVAL_MS) return
+    this.lastHudThumbWallMs = now
+
+    const list = Array.from(this.alive.values())
+      .filter((o) => o.leaderboardListed)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, this.params.topN)
+
+    for (const org of list) {
+      try {
+        org.thumbnail = renderThumbnail(org, sim, this.colors, vp)
+      } catch {
+        // Canvas creation can fail in some headless envs; non-fatal.
+      }
+    }
+  }
+
+  private step(sim: Sim) {
     this.trackerStep++
     this.lastSimFrame = sim.frame
 
@@ -179,22 +224,6 @@ export class OrganismTracker {
     if (this.dead.length > this.params.deadCap) {
       this.dead.length = this.params.deadCap
     }
-
-    // Periodic thumbnail snapshots for all alive (cheap; OffscreenCanvas where possible).
-    if (this.trackerStep % this.params.snapshotInterval === 0) {
-      for (const org of this.alive.values()) {
-        try {
-          org.thumbnail = renderThumbnail(
-            org,
-            sim,
-            this.colors,
-            thumbnailViewport
-          )
-        } catch {
-          // Canvas creation can fail in some headless envs; non-fatal.
-        }
-      }
-    }
   }
 
   private updateOrganism(
@@ -242,6 +271,49 @@ export class OrganismTracker {
 
     org.stability = computeStability(org, sim)
     org.score = computeScore(org)
+
+    pushCapped(
+      org.history.gateComposite,
+      org.stability.composite,
+      this.params.windowSize
+    )
+    pushCapped(
+      org.history.gateSymmetry,
+      org.stability.symmetry,
+      this.params.windowSize
+    )
+
+    const avgC =
+      org.history.gateComposite.length > 0
+        ? meanSample(org.history.gateComposite)
+        : org.stability.composite
+    const avgS =
+      org.history.gateSymmetry.length > 0
+        ? meanSample(org.history.gateSymmetry)
+        : org.stability.symmetry
+    org.leaderboardAvgComposite = avgC
+    org.leaderboardAvgSymmetry = avgS
+
+    const stabGate = this.params.stabilityGate
+    const symGate = this.params.symmetryGate
+    const avgPass = avgC >= stabGate && avgS >= symGate
+    const grace = this.params.leaderboardGraceSeconds
+
+    if (avgPass) {
+      org.leaderboardEverMetGates = true
+      org.leaderboardGraceSinceAge = null
+      org.leaderboardListed = true
+    } else if (org.leaderboardEverMetGates) {
+      if (org.leaderboardGraceSinceAge === null) {
+        org.leaderboardGraceSinceAge = org.ageSeconds
+      }
+      const inGrace =
+        org.ageSeconds - org.leaderboardGraceSinceAge < grace
+      org.leaderboardListed = inGrace
+    } else {
+      org.leaderboardGraceSinceAge = null
+      org.leaderboardListed = false
+    }
   }
 
   private createOrganism(c: Cluster, sim: Sim, parentId?: number) {
@@ -267,17 +339,25 @@ export class OrganismTracker {
         size: [c.size],
         rg: [c.rg],
         members: [Array.from(c.members)],
+        gateComposite: [],
+        gateSymmetry: [],
       },
       stability: {
         membership: 1,
         shape: 1,
         velocityCoherence: 0.5,
         size: 1,
-        composite: 0.7,
+        symmetry: 1,
+        composite: 0.895,
       },
       speedAvg: speedNow,
       speedNow,
       score: 0,
+      leaderboardAvgComposite: 0.895,
+      leaderboardAvgSymmetry: 1,
+      leaderboardEverMetGates: false,
+      leaderboardGraceSinceAge: null,
+      leaderboardListed: false,
     }
     if (parentId !== undefined) org.parentId = parentId
     org.score = computeScore(org)

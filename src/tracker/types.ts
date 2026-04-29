@@ -25,6 +25,10 @@ export type OrganismHistory = {
   size: number[]
   rg: number[]
   members: number[][]
+  /** Rolling samples of composite stability (same cadence/window as gates). */
+  gateComposite: number[]
+  /** Rolling samples of symmetry score. */
+  gateSymmetry: number[]
 }
 
 export type Stability = {
@@ -32,6 +36,8 @@ export type Stability = {
   shape: number
   velocityCoherence: number
   size: number
+  /** Bilateral symmetry about axes through CoM (~count balance in mirrored half-planes). */
+  symmetry: number
   /** 0..1 weighted composite. */
   composite: number
 }
@@ -75,6 +81,26 @@ export type Organism = {
   /** Composite score for ranking. */
   score: number
 
+  /**
+   * Rolling mean of composite over `gateComposite` history (same window as tracker).
+   * Used for leaderboard eligibility vs `stabilityGate`.
+   */
+  leaderboardAvgComposite: number
+  /** Rolling mean of symmetry over `gateSymmetry` history. */
+  leaderboardAvgSymmetry: number
+  /**
+   * True once rolling averages have met stability+symmetry gates at least once.
+   * Grace-only removal applies after this (avoids grace before first qualify).
+   */
+  leaderboardEverMetGates: boolean
+  /**
+   * When rolling averages dipped below gates after `leaderboardEverMetGates`,
+   * sim age (`ageSeconds`) at the start of that dip; used for grace period.
+   */
+  leaderboardGraceSinceAge: number | null
+  /** Whether this organism counts for the competitors panel (average gates + grace). */
+  leaderboardListed: boolean
+
   thumbnail?: ImageData
 }
 
@@ -87,16 +113,21 @@ export type TrackerParams = {
   tauMatch: number
   /** Sliding window length in tracker steps. */
   windowSize: number
-  /** Tracker steps between thumbnail refreshes. */
-  snapshotInterval: number
   /** Max dead organisms retained. */
   deadCap: number
   /** Composite stability gate to enter visible top-N. */
   stabilityGate: number
+  /** Symmetry gate ([0,1]): minimum bilateral symmetry score to appear in leaderboard. */
+  symmetryGate: number
   /** Sim animation frames per tracker step (subsample to keep cost bounded). */
   framesPerStep: number
   /** Cap on visible alive list. */
   topN: number
+  /**
+   * After rolling averages dip below gates, keep showing the organism this many
+   * sim seconds before dropping from the competitors list (unless averages recover).
+   */
+  leaderboardGraceSeconds: number
 }
 
 export const DEFAULT_TRACKER_PARAMS: TrackerParams = {
@@ -104,11 +135,12 @@ export const DEFAULT_TRACKER_PARAMS: TrackerParams = {
   nMin: 4,
   tauMatch: 0.5,
   windowSize: 60,
-  snapshotInterval: 30,
   deadCap: 8,
-  stabilityGate: 0.55,
+  stabilityGate: 0.95,
+  symmetryGate: 0.9,
   framesPerStep: 4,
   topN: 8,
+  leaderboardGraceSeconds: 4,
 }
 
 export type TrackerSnapshot = {
@@ -120,4 +152,11 @@ export type TrackerSnapshot = {
   frameAt: number
   /** Currently highlighted organism id (or null). */
   highlightId: number | null
+  /**
+   * Matches main canvas `layout.dpr` — use with `ImageData` width/height so
+   * thumbnails display at one CSS pixel per device pixel (pixelated map match).
+   */
+  thumbnailDpr?: number
+  /** `viewW / viewH` from main canvas — fixed-size thumb slots keep this aspect. */
+  thumbnailViewAspect?: number
 }

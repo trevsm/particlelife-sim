@@ -5,6 +5,7 @@
  * - shape: how rigid is the cluster (variance of radius of gyration / mean rg)
  * - velocityCoherence: avg cosine between member velocity and CoM velocity
  * - size: stddev(N) / mean(N) inverted
+ * - symmetry: bilateral balance across vertical/horizontal axes through CoM ([0,1])
  * - composite: weighted blend, all in [0,1]
  *
  * The composite score for ranking blends stability with longevity and size.
@@ -13,6 +14,7 @@
  * by living a long time.
  */
 
+import type { Sim } from "../simTypes"
 import type { Organism, Stability } from "./types"
 
 export function jaccard(a: Set<number>, b: Set<number>): number {
@@ -44,9 +46,44 @@ export function overlapFraction(a: Set<number>, b: Set<number>): number {
   return inter / a.size
 }
 
-type VelView = { vx: Float32Array; vy: Float32Array }
+/** Bilateral symmetry: balance of particle counts across CoM-aligned half-planes, wrap-aware. */
+export function symmetryScore(org: Organism, sim: Sim): number {
+  const cx = org.com[0]
+  const cy = org.com[1]
+  const wrap = sim.spec.wrap
+  const whw = sim.worldHalfW
+  const whh = sim.worldHalfH
+  const wW = 2 * whw
+  const wH = 2 * whh
 
-export function computeStability(org: Organism, sim: VelView): Stability {
+  let nLeft = 0
+  let nRight = 0
+  let nBelow = 0
+  let nAbove = 0
+  let n = 0
+  for (const i of org.members) {
+    let dx = sim.x[i] - cx
+    let dy = sim.y[i] - cy
+    if (wrap) {
+      if (dx > whw) dx -= wW
+      else if (dx < -whw) dx += wW
+      if (dy > whh) dy -= wH
+      else if (dy < -whh) dy += wH
+    }
+    n++
+    if (dx <= 0) nLeft++
+    else nRight++
+    if (dy <= 0) nBelow++
+    else nAbove++
+  }
+
+  if (n === 0) return 1
+  const symX = 1 - Math.abs(nLeft - nRight) / n
+  const symY = 1 - Math.abs(nBelow - nAbove) / n
+  return Math.max(0, Math.min(1, (symX + symY) / 2))
+}
+
+export function computeStability(org: Organism, sim: Sim): Stability {
   const hist = org.history
 
   // membership stability — avg Jaccard between consecutive history snapshots
@@ -129,17 +166,21 @@ export function computeStability(org: Organism, sim: VelView): Stability {
     velocityCoherence = meanSpeed < 0.05 ? 0.7 : 0.2
   }
 
+  const symmetry = symmetryScore(org, sim)
+
   const composite =
-    0.35 * membership +
-    0.25 * shape +
-    0.25 * velocityCoherence +
-    0.15 * size
+    0.31 * membership +
+    0.21 * shape +
+    0.21 * velocityCoherence +
+    0.12 * size +
+    0.15 * symmetry
 
   return {
     membership,
     shape,
     velocityCoherence,
     size,
+    symmetry,
     composite,
   }
 }
@@ -150,9 +191,10 @@ export function computeScore(org: Organism): number {
   const sizeBonus = Math.log1p(org.size)
   return (
     ageBonus *
-    (0.5 * org.stability.composite +
-      0.3 * org.stability.velocityCoherence +
-      0.2 * sizeBonus)
+    (0.44 * org.stability.composite +
+      0.26 * org.stability.velocityCoherence +
+      0.15 * sizeBonus +
+      0.15 * org.stability.symmetry)
   )
 }
 

@@ -274,7 +274,9 @@ function saveRulesToLS(
 ) {
   try {
     localStorage.setItem(LS_KEY_V2, JSON.stringify({ K, A, rMinMx, RMx }))
-  } catch {}
+  } catch {
+    /* storage may be unavailable */
+  }
 }
 
 function loadRulesFromLS(
@@ -1697,6 +1699,10 @@ export default function App() {
     null
   )
   const [competitorsCollapsed, setCompetitorsCollapsed] = useState(false)
+  const competitorsCollapsedRef = useRef(competitorsCollapsed)
+  useEffect(() => {
+    competitorsCollapsedRef.current = competitorsCollapsed
+  }, [competitorsCollapsed])
 
   const {
     glCanvasRef,
@@ -2088,11 +2094,25 @@ export default function App() {
         stride > 2 ? 1.05 : stride > 1 ? 1.25 : n > 400_000 ? 1.2 : 1.75
 
       if (!paused) {
-        trackerRef.current?.observe(sim, {
-          worldHalfW: layout.worldHalfW,
-          viewW: layout.viewW,
-          pointPxCss,
-        })
+        trackerRef.current?.observe(
+          sim,
+          {
+            layout: {
+              width: layout.width,
+              height: layout.height,
+              dpr: layout.dpr,
+              viewX: layout.viewX,
+              viewY: layout.viewY,
+              viewW: layout.viewW,
+              viewH: layout.viewH,
+              worldHalfW: layout.worldHalfW,
+              worldHalfH: layout.worldHalfH,
+            },
+            camera: { ...viewCameraRef.current },
+            pointPxCss,
+          },
+          { skipHudThumbnails: competitorsCollapsedRef.current }
+        )
       }
 
       drawParticles(
@@ -2151,9 +2171,8 @@ export default function App() {
     return () => cancelAnimationFrame(raf)
   }, [debugHud])
 
-  // Publish tracker snapshot to React at ~4Hz so the Competitors panel re-renders
-  // without forcing a render every animation frame. organismHighlight is read via
-  // ref so hovering doesn't restart the interval.
+  // Publish tracker snapshot to React — ~30fps when competitors panel shows live thumbs,
+  // slower when collapsed to reduce main-thread wakeups.
   const organismHighlightRef = useRef<number | null>(null)
   useEffect(() => {
     organismHighlightRef.current = organismHighlight
@@ -2165,16 +2184,23 @@ export default function App() {
       if (cancelled) return
       const tracker = trackerRef.current
       if (tracker) {
-        setTrackerSnapshot(tracker.snapshot(organismHighlightRef.current))
+        setTrackerSnapshot({
+          ...tracker.snapshot(organismHighlightRef.current),
+          thumbnailDpr: layoutRef.current?.dpr ?? 1,
+          thumbnailViewAspect: layoutRef.current
+            ? layoutRef.current.viewW / layoutRef.current.viewH
+            : undefined,
+        })
       }
-      id = setTimeout(tick, 250)
+      const delay = competitorsCollapsedRef.current ? 250 : 1000 / 30
+      id = setTimeout(tick, delay)
     }
     tick()
     return () => {
       cancelled = true
       if (id !== null) clearTimeout(id)
     }
-  }, [])
+  }, [competitorsCollapsed])
 
   // persist interaction rules
   useEffect(() => {
@@ -2265,7 +2291,8 @@ export default function App() {
       style={{
         display: "grid",
         gridTemplateRows: debugHud ? "auto 1fr auto" : "1fr",
-        minHeight: "100vh",
+        height: "100%",
+        overflow: "hidden",
         background: "#0a0a0a",
         color: "#eaeaea",
         fontFamily:
@@ -2701,7 +2728,11 @@ export default function App() {
         />
         <Competitors
           snapshot={trackerSnapshot}
-          stabilityGate={trackerRef.current?.params.stabilityGate ?? 0.55}
+          stabilityGate={trackerRef.current?.params.stabilityGate ?? 0.95}
+          symmetryGate={trackerRef.current?.params.symmetryGate ?? 0.9}
+          leaderboardGraceSeconds={
+            trackerRef.current?.params.leaderboardGraceSeconds ?? 4
+          }
           topN={trackerRef.current?.params.topN ?? 8}
           onHover={setOrganismHighlight}
           collapsed={competitorsCollapsed}
