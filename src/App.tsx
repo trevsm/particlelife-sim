@@ -1700,42 +1700,137 @@ export default function App() {
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
+    const viewport = el
     const cam = viewCameraRef
     const layoutRefLocal = layoutRef
+    /** Active pointers (needed for pinch; single-touch uses same map). */
+    const pointers = new Map<number, { x: number; y: number }>()
     let dragging = false
     let lx = 0
     let ly = 0
+    /** World point + zoom anchored at pinch start (two fingers). */
+    let pinch:
+      | {
+          dist0: number
+          zoom0: number
+          worldX: number
+          worldY: number
+        }
+      | undefined
+
+    function worldUnderClient(clientX: number, clientY: number): {
+      worldX: number
+      worldY: number
+      nx: number
+      ny: number
+      layout: ViewLayout
+    } | null {
+      const layout = layoutRefLocal.current
+      if (!layout) return null
+      const rect = viewport.getBoundingClientRect()
+      const mx = clientX - rect.left
+      const my = clientY - rect.top
+      const nx = (mx - layout.viewX) / layout.viewW
+      const ny = (my - layout.viewY) / layout.viewH
+      const { panX, panY, zoom } = cam.current
+      const hw = layout.worldHalfW / zoom
+      const hh = layout.worldHalfH / zoom
+      const worldX = panX + (nx - 0.5) * 2 * hw
+      const worldY = panY + (ny - 0.5) * 2 * hh
+      return { worldX, worldY, nx, ny, layout }
+    }
+
+    function initPinchFromTwoTouches() {
+      const ids = [...pointers.keys()]
+      if (ids.length < 2) return
+      const pa = pointers.get(ids[0]!)!
+      const pb = pointers.get(ids[1]!)!
+      const cx = (pa.x + pb.x) * 0.5
+      const cy = (pa.y + pb.y) * 0.5
+      const dist = Math.hypot(pb.x - pa.x, pb.y - pa.y)
+      const w = worldUnderClient(cx, cy)
+      if (!w) return
+      pinch = {
+        dist0: Math.max(dist, 1e-6),
+        zoom0: cam.current.zoom,
+        worldX: w.worldX,
+        worldY: w.worldY,
+      }
+    }
 
     const onPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0) return
-      dragging = true
-      lx = e.clientX
-      ly = e.clientY
+      if (e.pointerType === "mouse" && e.button !== 0) return
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
       el.style.cursor = "grabbing"
-      try {
-        el.setPointerCapture(e.pointerId)
-      } catch {
-        /* ignore */
+      if (pointers.size === 1) {
+        dragging = true
+        pinch = undefined
+        lx = e.clientX
+        ly = e.clientY
+        try {
+          el.setPointerCapture(e.pointerId)
+        } catch {
+          /* ignore */
+        }
+      } else if (pointers.size === 2) {
+        dragging = false
+        const firstId = [...pointers.keys()][0]!
+        try {
+          el.releasePointerCapture(firstId)
+        } catch {
+          /* ignore */
+        }
+        initPinchFromTwoTouches()
       }
     }
     const onPointerMove = (e: PointerEvent) => {
+      if (!pointers.has(e.pointerId)) return
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const layout = layoutRefLocal.current
+      if (!layout) return
+
+      if (pointers.size >= 2) {
+        const ids = [...pointers.keys()]
+        const pa = pointers.get(ids[0]!)!
+        const pb = pointers.get(ids[1]!)!
+        const cx = (pa.x + pb.x) * 0.5
+        const cy = (pa.y + pb.y) * 0.5
+        const dist = Math.hypot(pb.x - pa.x, pb.y - pa.y)
+        if (!pinch) {
+          initPinchFromTwoTouches()
+        }
+        const st = pinch
+        if (st) {
+          const newZoom = Math.min(
+            ZOOM_MAX,
+            Math.max(ZOOM_MIN, st.zoom0 * (dist / st.dist0))
+          )
+          const rect = viewport.getBoundingClientRect()
+          const mx = cx - rect.left
+          const my = cy - rect.top
+          const nx = (mx - layout.viewX) / layout.viewW
+          const ny = (my - layout.viewY) / layout.viewH
+          const hw2 = layout.worldHalfW / newZoom
+          const hh2 = layout.worldHalfH / newZoom
+          cam.current.zoom = newZoom
+          cam.current.panX = st.worldX - (nx - 0.5) * 2 * hw2
+          cam.current.panY = st.worldY - (ny - 0.5) * 2 * hh2
+        }
+        return
+      }
+
       if (!dragging) return
       const dx = e.clientX - lx
       const dy = e.clientY - ly
       lx = e.clientX
       ly = e.clientY
-      const layout = layoutRefLocal.current
-      if (!layout) return
       const z = cam.current.zoom
       const hw = layout.worldHalfW / z
       const hh = layout.worldHalfH / z
       cam.current.panX -= (dx / layout.viewW) * 2 * hw
-      // Match WebGL VS: tv = ((wpos.y - cam.y) + hh) / (2*hh) (+y → downward on screen).
       cam.current.panY -= (dy / layout.viewH) * 2 * hh
     }
     const endDrag = (e?: PointerEvent) => {
-      dragging = false
-      el.style.cursor = "grab"
       if (e) {
         try {
           el.releasePointerCapture(e.pointerId)
@@ -1746,16 +1841,44 @@ export default function App() {
     }
     const onPointerUp = (e: PointerEvent) => {
       endDrag(e)
+      pointers.delete(e.pointerId)
+      if (pointers.size === 0) {
+        dragging = false
+        pinch = undefined
+        el.style.cursor = "grab"
+      } else if (pointers.size === 1) {
+        pinch = undefined
+        const rem = [...pointers.values()][0]!
+        lx = rem.x
+        ly = rem.y
+        dragging = true
+        const pid = [...pointers.keys()][0]!
+        try {
+          el.setPointerCapture(pid)
+        } catch {
+          /* ignore */
+        }
+      }
     }
-    const onPointerCancel = () => {
-      dragging = false
-      el.style.cursor = "grab"
+    const onPointerCancel = (e: PointerEvent) => {
+      pointers.delete(e.pointerId)
+      if (pointers.size === 0) {
+        dragging = false
+        pinch = undefined
+        el.style.cursor = "grab"
+      } else if (pointers.size === 1) {
+        pinch = undefined
+        const rem = [...pointers.values()][0]!
+        lx = rem.x
+        ly = rem.y
+        dragging = true
+      }
     }
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
       const layout = layoutRefLocal.current
       if (!layout) return
-      const rect = el.getBoundingClientRect()
+      const rect = viewport.getBoundingClientRect()
       const mx = e.clientX - rect.left
       const my = e.clientY - rect.top
       const { panX, panY, zoom } = cam.current
@@ -2496,6 +2619,8 @@ export default function App() {
           height: "100%",
           minHeight: 0,
           overflow: "hidden",
+          userSelect: "none",
+          WebkitUserSelect: "none",
         }}
       >
         <canvas
@@ -2538,7 +2663,7 @@ export default function App() {
           cell={spec.cellSize} · seed={seed}
         </span>
         <span style={{ opacity: 0.65, marginLeft: 12 }}>
-          Drag to pan · wheel zoom · double-click reset view
+          Drag to pan · pinch or wheel zoom · double-click reset view
         </span>
       </div>
       )}
