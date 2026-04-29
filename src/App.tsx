@@ -15,6 +15,8 @@ import {
   OPEN_TRAIL_CHUNK_WORLD,
   openTrailVisibleChunkRange,
 } from "./openTrailChunks"
+import { OrganismTracker, type TrackerSnapshot } from "./tracker"
+import { Competitors } from "./Competitors"
 
 /**
  * Particle Life backend + editable ruleset (A matrix) with toolbar.
@@ -1683,6 +1685,19 @@ export default function App() {
   const viewCameraRef = useRef<ViewCamera>(defaultViewCamera())
   const [gpuPhysics, setGpuPhysics] = useState(false)
 
+  // -------- Organism tracker (Competitors panel)
+  const trackerRef = useRef<OrganismTracker | null>(null)
+  if (trackerRef.current === null) {
+    trackerRef.current = new OrganismTracker(TYPE_COLORS)
+  }
+  const [trackerSnapshot, setTrackerSnapshot] = useState<TrackerSnapshot>(
+    () => ({ alive: [], dead: [], frameAt: 0, highlightId: null })
+  )
+  const [organismHighlight, setOrganismHighlight] = useState<number | null>(
+    null
+  )
+  const [competitorsCollapsed, setCompetitorsCollapsed] = useState(false)
+
   const {
     glCanvasRef,
     overlayCanvasRef,
@@ -1977,6 +1992,8 @@ export default function App() {
     simTrailEpochRef.current++
     viewCameraRef.current = defaultViewCamera()
     gpuRunnerRef.current?.uploadParticleState(simRef.current)
+    trackerRef.current?.reset()
+    setTrackerSnapshot({ alive: [], dead: [], frameAt: 0, highlightId: null })
   }, [
     seed,
     spec.N,
@@ -2053,6 +2070,8 @@ export default function App() {
         if (useGpu) {
           gpu.subSteps = k
           gpu.step(sim)
+          // GPU path doesn't bump sim.frame; CPU step() does.
+          sim.frame++
         } else {
           for (let s = 0; s < k; s++) {
             step(sim)
@@ -2067,6 +2086,15 @@ export default function App() {
         drawN > 0 && n > drawN ? Math.max(1, Math.ceil(n / drawN)) : 1
       const pointPxCss =
         stride > 2 ? 1.05 : stride > 1 ? 1.25 : n > 400_000 ? 1.2 : 1.75
+
+      if (!paused) {
+        trackerRef.current?.observe(sim, {
+          worldHalfW: layout.worldHalfW,
+          viewW: layout.viewW,
+          pointPxCss,
+        })
+      }
+
       drawParticles(
         pr,
         sim.interleaved,
@@ -2123,6 +2151,31 @@ export default function App() {
     return () => cancelAnimationFrame(raf)
   }, [debugHud])
 
+  // Publish tracker snapshot to React at ~4Hz so the Competitors panel re-renders
+  // without forcing a render every animation frame. organismHighlight is read via
+  // ref so hovering doesn't restart the interval.
+  const organismHighlightRef = useRef<number | null>(null)
+  useEffect(() => {
+    organismHighlightRef.current = organismHighlight
+  }, [organismHighlight])
+  useEffect(() => {
+    let cancelled = false
+    let id: ReturnType<typeof setTimeout> | null = null
+    const tick = () => {
+      if (cancelled) return
+      const tracker = trackerRef.current
+      if (tracker) {
+        setTrackerSnapshot(tracker.snapshot(organismHighlightRef.current))
+      }
+      id = setTimeout(tick, 250)
+    }
+    tick()
+    return () => {
+      cancelled = true
+      if (id !== null) clearTimeout(id)
+    }
+  }, [])
+
   // persist interaction rules
   useEffect(() => {
     if (
@@ -2171,6 +2224,8 @@ export default function App() {
     simTrailEpochRef.current++
     viewCameraRef.current = defaultViewCamera()
     gpuRunnerRef.current?.uploadParticleState(simRef.current)
+    trackerRef.current?.reset()
+    setTrackerSnapshot({ alive: [], dead: [], frameAt: 0, highlightId: null })
   }
   const handleRandomizeSeed = () => setSeed(Math.floor(Math.random() * 1e9))
   const incN = (delta: number) => {
@@ -2643,6 +2698,14 @@ export default function App() {
             display: "block",
             pointerEvents: "none",
           }}
+        />
+        <Competitors
+          snapshot={trackerSnapshot}
+          stabilityGate={trackerRef.current?.params.stabilityGate ?? 0.55}
+          topN={trackerRef.current?.params.topN ?? 8}
+          onHover={setOrganismHighlight}
+          collapsed={competitorsCollapsed}
+          onToggleCollapse={() => setCompetitorsCollapsed((v) => !v)}
         />
       </div>
 
