@@ -6,7 +6,7 @@
  */
 
 import { AnimatePresence, LayoutGroup, motion } from "motion/react"
-import { useEffect, useRef, type CSSProperties } from "react"
+import { useLayoutEffect, useRef, type CSSProperties } from "react"
 import type { Organism, TrackerSnapshot } from "./tracker"
 
 type Props = {
@@ -396,18 +396,25 @@ function Thumbnail({
 }) {
   const ref = useRef<HTMLCanvasElement | null>(null)
   const img = org.thumbnail
-  useEffect(() => {
-    if (!ref.current || !img) return
-    const ctx = ref.current.getContext("2d")
+
+  // Resize + draw in layout phase so the browser never paints an empty/cleared
+  // canvas between frames (React-controlled width/height clears the bitmap).
+  useLayoutEffect(() => {
+    const canvas = ref.current
+    if (!canvas || !img || img.width < 1 || img.height < 1) return
+    const ctx = canvas.getContext("2d")
     if (!ctx) return
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+      canvas.width = img.width
+      canvas.height = img.height
+    }
     ctx.imageSmoothingEnabled = false
     ctx.putImageData(img, 0, 0)
   }, [img])
+
   return (
     <canvas
       ref={ref}
-      width={img?.width ?? 1}
-      height={img?.height ?? 1}
       style={{
         width: thumbCssWidth,
         height: thumbCssHeight,
